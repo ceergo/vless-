@@ -1,29 +1,43 @@
-#!/bin/bash
-# Скрипт установки бинарников для GitHub Actions
+name: Proxy Checker Bot
 
-set -e
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
 
-echo "Установка системных зависимостей..."
-sudo apt-get update && sudo apt-get install -y wget curl unzip jq
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-# 1. Установка Xray Core
-echo "Скачивание Xray Core..."
-XRAY_VERSION=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
-wget -q "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" -O xray.zip
-sudo unzip -o xray.zip -d /usr/local/bin
-sudo chmod +x /usr/local/bin/xray
-rm xray.zip
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
 
-# 2. Установка Librespeed-CLI
-echo "Скачивание Librespeed-CLI..."
-# Берем стабильную версию
-wget -q "https://github.com/librespeed/speedtest-cli/releases/download/v1.0.10/librespeed-cli_1.0.10_linux_amd64.tar.gz" -O librespeed.tar.gz
-sudo tar -xzf librespeed.tar.gz -C /usr/local/bin
-sudo chmod +x /usr/local/bin/librespeed-cli
-rm librespeed.tar.gz
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
 
-echo "Проверка бинарников..."
-/usr/local/bin/xray -version
-/usr/local/bin/librespeed-cli --version
+      - name: Setup Binaries (Root access)
+        run: |
+          # Даем права самому скрипту установки и запускаем его
+          chmod +x install.sh
+          ./install.sh
 
-echo "Все бинарники установлены успешно с правами Root."
+      - name: Run Proxy Checker with Sudo
+        run: |
+          # Запускаем основной скрипт от имени суперпользователя
+          sudo python3 main.py
+
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "actions@github.com"
+          git config --local user.name "GitHub Actions"
+          git add .
+          git commit -m "Update proxy lists [skip ci]" || echo "No changes to commit"
+          git push

@@ -1,7 +1,7 @@
 /**
  * Ultra-Light Gemini & Xray Checker (GitHub Ready)
  * Senior Coding Standard: Robustness, Logging, Idempotency.
- * 23.02.2026: Добавлена глубокая диагностика шагов проверки.
+ * 23.02.2026: Добавлена динамическая выборка портов для исключения конфликтов.
  */
 
 const fs = require('fs');
@@ -23,7 +23,8 @@ const CONFIG = {
     binDir: path.join(__dirname, 'bin'),
     ladspeedBin: path.join(__dirname, 'bin', 'ladspeed'),
     testTimeout: 20000,
-    geminiUrl: 'https://gemini.google.com'
+    geminiUrl: 'https://gemini.google.com',
+    portRange: { min: 30100, max: 30900 } // Диапазон для случайных портов
 };
 
 // --- ЛОГИРОВАНИЕ ---
@@ -32,6 +33,11 @@ const log = (msg, type = 'INFO') => {
     const colors = { INFO: '\x1b[36m', SUCCESS: '\x1b[32m', WARN: '\x1b[33m', ERROR: '\x1b[31m', DEBUG: '\x1b[90m', TRACE: '\x1b[95m' };
     console.log(`${colors[type] || ''}[${timestamp}] [${type}] ${msg}\x1b[0m`);
 };
+
+// --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+function getRandomPort() {
+    return Math.floor(Math.random() * (CONFIG.portRange.max - CONFIG.portRange.min + 1)) + CONFIG.portRange.min;
+}
 
 // --- ИНИЦИАЛИЗАЦИЯ ---
 function init() {
@@ -104,12 +110,12 @@ function addToDead(configLine) {
     fs.appendFileSync(CONFIG.files.dead, hash + '\n');
 }
 
-// --- ПРОВЕРКА ГЕМИНИ (С ГЛУБОКИМ ЛОГИРОВАНИЕМ) ---
+// --- ПРОВЕРКА ГЕМИНИ ---
 async function checkGemini(port) {
     const proxyUrl = `http://127.0.0.1:${port}`;
     const agent = new HttpProxyAgent(proxyUrl);
     
-    log(`[STEP 2] HTTP Запрос к Gemini через ${proxyUrl}...`, 'TRACE');
+    log(`[STEP 2] HTTP Запрос к Gemini через порт ${port}...`, 'TRACE');
 
     try {
         const response = await axios.get(CONFIG.geminiUrl, {
@@ -135,7 +141,7 @@ async function checkGemini(port) {
         return { ok: false, url: finalUrl, status: response.status, msg: 'Маркер /app не найден в редиректе' };
     } catch (err) {
         let errMsg = err.message;
-        if (err.code === 'ECONNREFUSED') errMsg = `Порт ${port} закрыт (Бинарник не прокинул туннель)`;
+        if (err.code === 'ECONNREFUSED') errMsg = `Порт ${port} закрыт (Туннель не поднялся)`;
         if (err.code === 'ETIMEDOUT' || err.code === 'ECONNABORTED') errMsg = `Таймаут соединения через прокси`;
         
         return { ok: false, error: errMsg, code: err.code };
@@ -145,12 +151,11 @@ async function checkGemini(port) {
 // --- ТЕСТ КОНФИГА ---
 async function testConfig(line, port) {
     return new Promise((resolve) => {
-        // Очистка порта
+        // Очистка порта перед использованием (на всякий случай)
         try { execSync(`fuser -k ${port}/tcp`, { stdio: 'ignore' }); } catch(e) {}
 
-        log(`[STEP 1] Запуск бинарника для порта ${port}...`, 'TRACE');
+        log(`[STEP 1] Запуск бинарника на случайном порту ${port}...`, 'TRACE');
         
-        // Передаем аргументы списком, чтобы избежать проблем с кавычками в shell
         const proc = spawn(CONFIG.ladspeedBin, ['-p', port.toString(), '-config-line', line], {
             detached: true,
             stdio: ['pipe', 'pipe', 'pipe']
@@ -158,7 +163,6 @@ async function testConfig(line, port) {
 
         let binaryLogs = '';
         
-        // Захват логов в реальном времени
         const onData = (data) => {
             const str = data.toString();
             binaryLogs += str;
@@ -180,21 +184,18 @@ async function testConfig(line, port) {
 
         let isResolved = false;
 
-        // Даем бинарнику 5 секунд на старт и только потом делаем запрос
         const startWait = setTimeout(async () => {
             if (isResolved) return;
 
-            log(`[STEP 1.5] Пауза на прогрев бинарника завершена. Проверка логов...`, 'DEBUG');
-            if (binaryLogs) {
-                console.log(`--- ТЕКУЩИЙ ЛОГ БИНАРНИКА ---\n${binaryLogs.trim()}\n--- КОНЕЦ ЛОГА ---`);
-            } else {
-                log('Бинарник ничего не вывел в консоль (молчит).', 'WARN');
-            }
-
+            log(`[STEP 1.5] Пауза на прогрев завершена. Проверка порта ${port}...`, 'DEBUG');
+            
             const result = await checkGemini(port);
             
             if (!result.ok && result.error) {
                 log(`Диагностика неудачи: ${result.error}`, 'ERROR');
+                if (binaryLogs) {
+                    console.log(`--- ЛОГ БИНАРНИКА ---\n${binaryLogs.trim()}\n--- КОНЕЦ ---`);
+                }
             }
 
             cleanup();
@@ -213,8 +214,7 @@ async function testConfig(line, port) {
 
         proc.on('exit', (code) => {
             if (!isResolved) {
-                log(`Бинарник внезапно упал с кодом ${code}`, 'ERROR');
-                // Если он упал, не ждем таймаута
+                log(`Бинарник упал с кодом ${code} до завершения теста.`, 'ERROR');
                 clearTimeout(startWait);
                 isResolved = true;
                 resolve({ ok: false, error: `Binary exited with code ${code}`, logs: binaryLogs });
@@ -247,12 +247,14 @@ async function main() {
 
     for (let i = 0; i < tasks.length; i++) {
         const line = tasks[i];
-        log(`[${i + 1}/${tasks.length}] === ТЕСТ КОНФИГА ===`);
+        const currentPort = getRandomPort(); // Генерируем новый порт для каждого теста
+        
+        log(`[${i + 1}/${tasks.length}] === ТЕСТ (Порт: ${currentPort}) ===`);
 
-        const res = await testConfig(line, 30005);
+        const res = await testConfig(line, currentPort);
 
         if (res.ok) {
-            log(`[RESULT] SUCCESS! Доступ к Gemini подтвержден.`, 'SUCCESS');
+            log(`[RESULT] SUCCESS! Доступ подтвержден.`, 'SUCCESS');
             currentGemini.push(line);
             fs.writeFileSync(CONFIG.files.gemini, [...new Set(currentGemini)].join('\n'));
         } else {

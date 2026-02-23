@@ -1,0 +1,109 @@
+import os, json, time, subprocess, base64, signal, requests
+from concurrent.futures import ThreadPoolExecutor
+
+REMOTE_STABLE_URL = "https://raw.githubusercontent.com/ceergo/parss/main/my_stable_configs.txt"
+TARGET_URL = "https://gemini.google.com/app?hl=ru"
+CHECK_MARKER = "app"
+XRAY_BIN = "/usr/local/bin/xray"
+INPUT_FILE = "links.txt"
+RESULT_GEMINI = "gemini_ok.txt"
+RESULT_GENERAL = "general_ok.txt"
+MAX_THREADS = 15
+START_PORT = 15000
+
+def parse_link(link):
+    link = link.strip()
+    if not link: return None
+    return {"protocol": link.split("://")[0], "raw": link}
+
+def generate_config(link_data, port):
+    return {
+        "log": {"loglevel": "none"},
+        "dns": {"servers": ["1.1.1.1", "8.8.8.8", "localhost"]},
+        "inbounds": [{
+            "port": port, "listen": "127.0.0.1", "protocol": "socks",
+            "settings": {"udp": True},
+            "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}
+        }],
+        "outbounds": [{"protocol": "freedom", "settings": {}, "streamSettings": {"tlsSettings": {"fingerprint": "chrome"}}}]
+    }
+
+class ProxyChecker:
+    def __init__(self, link, idx):
+        self.link = link
+        self.port = START_PORT + idx
+        self.config_path = f"config_{self.port}.json"
+        self.proc = None
+
+    def start(self):
+        data = parse_link(self.link)
+        if not data: return False
+        with open(self.config_path, "w") as f: json.dump(generate_config(data, self.port), f)
+        self.proc = subprocess.Popen(["sudo", XRAY_BIN, "-c", self.config_path], 
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=os.setsid)
+        time.sleep(2.5)
+        return True
+
+    def test(self):
+        res = {"gemini": False, "speed": 0, "active": False}
+        proxy = f"socks5h://127.0.0.1:{self.port}"
+        try:
+            check = subprocess.run(["curl", "-sL", "--proxy", proxy, "--max-time", "12", TARGET_URL], capture_output=True, text=True)
+            if CHECK_MARKER in check.stdout.lower():
+                res["gemini"] = True
+                res["active"] = True
+            elif check.returncode == 0:
+                res["active"] = True
+            
+            if res["active"]:
+                s_check = subprocess.run(["curl", "-s", "--proxy", proxy, "-o", "/dev/null", "-w", "%{speed_download}", "--max-time", "15", "https://speed.cloudflare.com/__down?bytes=1048576"], capture_output=True, text=True)
+                res["speed"] = float(s_check.stdout.strip()) / 1024 / 1024
+        except: pass
+        return res
+
+    def stop(self):
+        if self.proc:
+            try: os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+            except: pass
+        if os.path.exists(self.config_path): os.remove(self.config_path)
+
+def process_task(data):
+    link, i = data
+    chk = ProxyChecker(link, i)
+    status = {"link": link, "type": "dead"}
+    try:
+        if chk.start():
+            m = chk.test()
+            if m["gemini"] and m["speed"] > 0.1: status["type"] = "gemini"
+            elif m["active"]: status["type"] = "general"
+    finally: chk.stop()
+    return status
+
+def main():
+    print("Fetching stable configs...")
+    r_links = []
+    try:
+        r = requests.get(REMOTE_STABLE_URL, timeout=15)
+        if r.status_code == 200: r_links = [l.strip() for l in r.text.splitlines() if l.strip()]
+    except: pass
+    
+    l_links = []
+    if os.path.exists(INPUT_FILE):
+        with open(INPUT_FILE, "r") as f: l_links = [l.strip() for l in f if l.strip()]
+    
+    all_links = list(set(l_links + r_links))
+    print(f"Processing {len(all_links)} links...")
+    
+    with ThreadPoolExecutor(max_workers=MAX_THREADS) as pool:
+        results = list(pool.map(process_task, [(l, i) for i, l in enumerate(all_links)]))
+    
+    g_ok = [r["link"] for r in results if r["type"] == "gemini"]
+    o_ok = [r["link"] for r in results if r["type"] == "general"]
+    
+    with open(RESULT_GEMINI, "w") as f: f.write("\n".join(set(g_ok)))
+    with open(RESULT_GENERAL, "w") as f: f.write("\n".join(set(o_ok)))
+    with open(INPUT_FILE, "w") as f: f.write("\n".join(set(g_ok + o_ok)))
+    print("Done!")
+
+if __name__ == "__main__":
+    main()

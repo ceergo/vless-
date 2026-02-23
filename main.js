@@ -125,28 +125,57 @@ async function checkGemini(port) {
 // --- ТЕСТ КОНФИГА ---
 async function testConfig(line, port) {
     return new Promise((resolve) => {
-        // Логируем начало теста с частью ссылки для идентификации
-        const shortLine = line.substring(0, 50) + '...';
-        log(`[TESTING] Конфиг: ${shortLine}`);
+        // ВЫВОД ПОЛНОЙ СТРОКИ КОНФИГА ДЛЯ ОТЛАДКИ
+        log(`[FULL_CONFIG] Передаем в бинарник: ${line}`, 'DEBUG');
 
+        // Запускаем с перенаправлением вывода для отладки
         const proc = spawn(CONFIG.ladspeedBin, ['-p', port.toString(), '-config-line', line], {
-            detached: true
+            detached: true,
+            stdio: ['ignore', 'pipe', 'pipe']
         });
 
+        let binaryLogs = '';
+        proc.stderr.on('data', (data) => binaryLogs += data.toString());
+        proc.stdout.on('data', (data) => binaryLogs += data.toString());
+
         const cleanup = () => {
-            try { process.kill(-proc.pid, 'SIGKILL'); } catch(e) { proc.kill('SIGKILL'); }
+            try { 
+                // Убиваем дерево процессов (минус перед pid убивает группу)
+                process.kill(-proc.pid, 'SIGKILL'); 
+            } catch(e) { 
+                proc.kill('SIGKILL'); 
+            }
         };
 
-        // Ждем инициализации туннеля
-        setTimeout(async () => {
+        // Флаг для предотвращения двойного resolve
+        let isResolved = false;
+
+        // Таймер ожидания запуска порта
+        const startWait = setTimeout(async () => {
+            if (isResolved) return;
             const result = await checkGemini(port);
+            
+            if (!result.ok && result.error && result.error.includes('ECONNREFUSED')) {
+                log(`Бинарник не открыл порт 30005. Полный лог бинарника:\n${binaryLogs}`, 'ERROR');
+            }
+
             cleanup();
+            isResolved = true;
             resolve(result);
-        }, 3000);
+        }, 5000); // Увелили до 5 секунд для стабильности
 
         proc.on('error', (err) => {
-            log(`Ошибка запуска Ladspeed: ${err.message}`, 'ERROR');
-            resolve({ ok: false });
+            if (isResolved) return;
+            log(`Ошибка старта бинарника: ${err.message}`, 'ERROR');
+            clearTimeout(startWait);
+            cleanup();
+            isResolved = true;
+            resolve({ ok: false, error: err.message });
+        });
+
+        proc.on('exit', (code) => {
+            if (isResolved || code === null || code === 0) return;
+            log(`Бинарник неожиданно завершился с кодом ${code}. Лог:\n${binaryLogs}`, 'WARN');
         });
     });
 }
@@ -174,13 +203,11 @@ async function main() {
 
         if (res.ok) {
             log(`[UP] ПОДОШЁЛ!`, 'SUCCESS');
-            log(`  -> ВХОД: ${line.substring(0, 60)}...`, 'DEBUG');
             log(`  -> ВЫХОД: ${res.url}`, 'SUCCESS');
             results.gemini.push(line);
         } else {
             log(`[DOWN] ОТКЛОНЕН`, 'WARN');
-            log(`  -> ВХОД: ${line.substring(0, 60)}...`, 'DEBUG');
-            log(`  -> ВЫХОД: ${res.url || res.error || 'Нет маркера /app'}`, 'WARN');
+            log(`  -> ПРИЧИНА: ${res.url || res.error || 'Нет маркера /app'}`, 'WARN');
             addToDead(line);
         }
     }

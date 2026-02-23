@@ -21,6 +21,54 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          # Удалено cache: 'npm', так как нет package-lock.json
+
+      - name: Install dependencies
+        run: |
+          if [ ! -f package.json ]; then npm init -y; fi
+          npm install axios http-proxy-agent
+
+      - name: Prepare Binaries
+        run: |
+          mkdir -p bin
+          chmod +x bin/ladspeed || true
+          # Если бинарника нет, можно добавить команду скачивания здесь
+
+      - name: Run Checker
+        run: sudo node main.js
+        env:
+          # Можно передать секреты, если нужно
+          SUB_URL: ${{ github.event.client_payload.sub_url || 'ВАША_ДЕФОЛТНАЯ_ССЫЛКА' }}
+
+      - name: Commit and Push results
+        run: |
+          git config --global user.name "GeminiBot"
+          git config --global user.email "bot@gemini.check"
+          git add gemini.txt general.txt dead.txt || true
+          git commit -m "Auto-update proxy lists [skip ci]" || echo "No changes to commit"
+          git pushname: Gemini Proxy Checker
+
+on:
+  # Позволяет запускать вручную из интерфейса GitHub
+  workflow_dispatch:
+  # Позволяет запускать через API (от твоего бота)
+  repository_dispatch:
+    types: [run_proxy_check]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Даем права на запись изменений в файлы txt
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
           cache: 'npm'
 
       - name: Install dependencies

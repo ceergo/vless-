@@ -581,152 +581,176 @@ def build_normalized_subscription(raw_text: str) -> Tuple[Dict[str, str], Dict[s
 # ==========================
 
 
-def build_stream_settings(parsed: Dict[str, Any]) -> Dict:
-    net = parsed.get("network", "tcp")
-    sec = parsed.get("security", "none")
-    stream = {"network": net, "security": sec}
+def build_stream_settings(parsed: ParsedNode) -> Dict:
+    network = (parsed.network or "tcp").lower()
+    security = (parsed.security or "").lower()
+    sni = parsed.sni or parsed.host
 
-    if sec == "tls":
-        stream["tlsSettings"] = {
-            "serverName": parsed.get("sni") or parsed.get("host"),
-            "fingerprint": parsed.get("fp") or "chrome"
+    stream_settings: Dict = {"network": network}
+
+    if security in {"tls", "reality"}:
+        fp = parsed.fp or random.choice(TLS_FINGERPRINTS)
+        tls_settings: Dict = {
+            "serverName": sni,
+            "fingerprint": fp,
         }
-    elif sec == "reality":
-        stream["realitySettings"] = {
-            "serverName": parsed.get("sni") or parsed.get("host"),
-            "publicKey": parsed.get("pbk", ""),
-            "shortId": parsed.get("sid", ""),
-            "fingerprint": parsed.get("fp") or "chrome"
+        stream_settings["security"] = "tls"
+        stream_settings["tlsSettings"] = tls_settings
+
+    if network == "ws":
+        ws_settings: Dict = {
+            "path": parsed.path or "/",
+            "headers": {},
         }
+        if parsed.host_header:
+            ws_settings["headers"]["Host"] = parsed.host_header
+        elif sni:
+            ws_settings["headers"]["Host"] = sni
+        stream_settings["wsSettings"] = ws_settings
+    elif network == "grpc":
+        grpc_settings: Dict = {}
+        stream_settings["grpcSettings"] = grpc_settings
 
-    path = parsed.get("path", "")
-    if net == "ws":
-        stream["wsSettings"] = {"path": path if path.startswith("/") else f"/{path}"}
-    elif net == "grpc":
-        stream["grpcSettings"] = {"serviceName": path}
-    elif net == "xhttp":
-        stream["xhttpSettings"] = {"path": path, "mode": "auto"}
-        
-    return stream
+    return stream_settings
 
-def build_xray_config(parsed: Dict[str, Any], local_port: int) -> Dict:
+
+def build_xray_config(parsed: ParsedNode, local_port: int) -> Dict:
     """
-    Формирует Xray-конфиг.
+    Формирует минимально корректный Xray-конфиг с одним inbound (SOCKS5)
+    и одним outbound под конкретный узел.
     """
-    if not parsed.get("host") or not parsed.get("port"):
+    if not parsed.host or not parsed.port:
         raise ValueError("У узла нет host/port, невозможно построить конфиг Xray")
 
     outbound: Dict
     stream_settings = build_stream_settings(parsed)
-    proto = parsed["protocol"]
 
-    if proto == "vmess":
+    if parsed.protocol == "vmess":
         outbound = {
             "tag": "proxy",
             "protocol": "vmess",
             "settings": {
-                "vnext": [{
-                    "address": parsed["host"],
-                    "port": int(parsed["port"]),
-                    "users": [{
-                        "id": parsed["uuid"],
-                        "security": "auto"
-                    }]
-                }]
+                "vnext": [
+                    {
+                        "address": parsed.host,
+                        "port": parsed.port,
+                        "users": [
+                            {
+                                "id": parsed.uuid,
+                                "security": "auto",
+                            }
+                        ],
+                    }
+                ]
             },
-            "streamSettings": stream_settings
+            "streamSettings": stream_settings,
         }
-    elif proto == "vless":
+    elif parsed.protocol == "vless":
         outbound = {
             "tag": "proxy",
             "protocol": "vless",
             "settings": {
-                "vnext": [{
-                    "address": parsed["host"],
-                    "port": int(parsed["port"]),
-                    "users": [{
-                        "id": parsed["uuid"],
-                        "flow": parsed.get("flow", "")
-                    }]
-                }]
+                "vnext": [
+                    {
+                        "address": parsed.host,
+                        "port": parsed.port,
+                        "users": [
+                            {
+                                "id": parsed.uuid,
+                                "flow": parsed.flow or "",
+                            }
+                        ],
+                    }
+                ]
             },
-            "streamSettings": stream_settings
+            "streamSettings": stream_settings,
         }
-    elif proto == "trojan":
+    elif parsed.protocol == "trojan":
         outbound = {
             "tag": "proxy",
             "protocol": "trojan",
             "settings": {
-                "servers": [{
-                    "address": parsed["host"],
-                    "port": int(parsed["port"]),
-                    "password": parsed.get("uuid", ""),
-                    "sni": parsed.get("sni") or parsed["host"]
-                }]
+                "servers": [
+                    {
+                        "address": parsed.host,
+                        "port": parsed.port,
+                        "password": parsed.password or parsed.uuid,
+                        "sni": parsed.sni or parsed.host,
+                    }
+                ]
             },
-            "streamSettings": stream_settings
+            "streamSettings": stream_settings,
         }
-    elif proto in ("ss", "shadowsocks"):
-        method_pass = parsed.get("uuid", "")
-        method, password = "aes-256-gcm", method_pass
-        if ":" in method_pass:
-            method, password = method_pass.split(":", 1)
+    elif parsed.protocol == "ss":
         outbound = {
             "tag": "proxy",
             "protocol": "shadowsocks",
             "settings": {
-                "servers": [{
-                    "address": parsed["host"],
-                    "port": int(parsed["port"]),
-                    "method": method,
-                    "password": password
-                }]
-            }
+                "servers": [
+                    {
+                        "address": parsed.host,
+                        "port": parsed.port,
+                        "method": parsed.method or "aes-128-gcm",
+                        "password": parsed.password or "",
+                    }
+                ]
+            },
         }
-    elif proto in ("hy2", "hysteria2"):
+    elif parsed.protocol == "hy2":
         outbound = {
             "tag": "proxy",
             "protocol": "hysteria2",
             "settings": {
-                "servers": [{
-                    "address": parsed["host"],
-                    "port": int(parsed["port"]),
-                    "password": parsed.get("uuid", ""),
-                    "sni": parsed.get("sni") or parsed["host"]
-                }]
-            }
+                "servers": [
+                    {
+                        "address": parsed.host,
+                        "port": parsed.port,
+                        "password": parsed.password or parsed.uuid or "",
+                        "sni": parsed.sni or parsed.host,
+                    }
+                ]
+            },
         }
-    elif proto == "tuic":
+    elif parsed.protocol == "tuic":
         outbound = {
             "tag": "proxy",
             "protocol": "tuic",
             "settings": {
-                "servers": [{
-                    "address": parsed["host"],
-                    "port": int(parsed["port"]),
-                    "uuid": parsed["uuid"],
-                    "password": parsed.get("uuid", ""),
-                    "congestion_control": "bbr",
-                    "sni": parsed.get("sni") or parsed["host"]
-                }]
-            }
+                "servers": [
+                    {
+                        "address": parsed.host,
+                        "port": parsed.port,
+                        "password": parsed.password or parsed.uuid or "",
+                        "sni": parsed.sni or parsed.host,
+                    }
+                ]
+            },
         }
     else:
-        raise ValueError(f"Неподдерживаемый протокол: {proto}")
+        raise ValueError(f"Неподдерживаемый протокол: {parsed.protocol}")
 
-    config = {
-        "log": {"loglevel": "error"},
-        "inbounds": [{
-            "tag": "socks-in",
-            "listen": "127.0.0.1",
-            "port": local_port,
-            "protocol": "socks",
-            "settings": {"auth": "noauth", "udp": True}
-        }],
-        "outbounds": [outbound, {"protocol": "freedom", "tag": "direct"}]
+    config: Dict = {
+        "log": {
+            "loglevel": "warning",
+        },
+        "inbounds": [
+            {
+                "tag": "socks-in",
+                "listen": "127.0.0.1",
+                "port": local_port,
+                "protocol": "socks",
+                "settings": {
+                    "auth": "noauth",
+                    "udp": True,
+                },
+            }
+        ],
+        "outbounds": [
+            outbound,
+        ],
     }
-    return config
 
+    return config
 
 
 # ==========================
@@ -1151,4 +1175,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

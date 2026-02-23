@@ -1,7 +1,7 @@
 /**
  * Ultra-Light Gemini & Xray Checker (GitHub Ready)
  * Senior Coding Standard: Robustness, Logging, Idempotency.
- * 23.02.2026: Исправлен запуск бинарника (проблема Exit Code 0) и передача аргументов.
+ * 23.02.2026: Добавлена автоматическая загрузка бинарника под архитектуру системы.
  */
 
 const fs = require('fs');
@@ -22,6 +22,11 @@ const CONFIG = {
     },
     binDir: path.join(__dirname, 'bin'),
     ladspeedBin: path.join(__dirname, 'bin', 'ladspeed'),
+    // Ссылки на бинарники (версия v0.6.0 как пример стабильной)
+    binSources: {
+        'x64': 'https://github.com/uS-S/ladspeed/releases/download/v0.6.0/ladspeed-linux-amd64',
+        'arm64': 'https://github.com/uS-S/ladspeed/releases/download/v0.6.0/ladspeed-linux-arm64'
+    },
     testTimeout: 20000,
     geminiUrl: 'https://gemini.google.com',
     portRange: { min: 30100, max: 30900 }
@@ -39,30 +44,88 @@ function getRandomPort() {
     return Math.floor(Math.random() * (CONFIG.portRange.max - CONFIG.portRange.min + 1)) + CONFIG.portRange.min;
 }
 
+/**
+ * Загрузка файла по HTTPS
+ */
+async function downloadFile(url, dest) {
+    return new Promise((resolve, reject) => {
+        const file = fs.createWriteStream(dest);
+        https.get(url, (response) => {
+            if (response.statusCode === 302 || response.statusCode === 301) {
+                // Обработка редиректов (важно для GitHub Releases)
+                downloadFile(response.headers.location, dest).then(resolve).catch(reject);
+                return;
+            }
+            if (response.statusCode !== 200) {
+                reject(new Error(`Failed to download: ${response.statusCode}`));
+                return;
+            }
+            response.pipe(file);
+            file.on('finish', () => {
+                file.close();
+                resolve();
+            });
+        }).on('error', (err) => {
+            fs.unlink(dest, () => reject(err));
+        });
+    });
+}
+
+/**
+ * Гарантирует наличие рабочего бинарника
+ */
+async function ensureBinary() {
+    if (!fs.existsSync(CONFIG.binDir)) fs.mkdirSync(CONFIG.binDir, { recursive: true });
+
+    const arch = process.arch; // 'x64' или 'arm64'
+    const url = CONFIG.binSources[arch] || CONFIG.binSources['x64'];
+    
+    log(`Проверка бинарника для архитектуры: ${arch}...`, 'DEBUG');
+
+    // Если файл есть, проверяем, не "пустышка" ли он (размер > 1MB)
+    if (fs.existsSync(CONFIG.ladspeedBin)) {
+        const stats = fs.statSync(CONFIG.ladspeedBin);
+        if (stats.size > 1024 * 1024) {
+            log('Рабочий бинарник уже на месте.', 'SUCCESS');
+            return;
+        }
+        log('Обнаружен некорректный бинарник (пустой файл), удаляю...', 'WARN');
+        fs.unlinkSync(CONFIG.ladspeedBin);
+    }
+
+    log(`Загрузка актуального бинарника из ${url}...`);
+    try {
+        await downloadFile(url, CONFIG.ladspeedBin);
+        fs.chmodSync(CONFIG.ladspeedBin, '755');
+        log('Бинарник успешно загружен и подготовлен.', 'SUCCESS');
+    } catch (e) {
+        log(`Не удалось скачать бинарник: ${e.message}`, 'ERROR');
+        process.exit(1);
+    }
+}
+
 // --- ИНИЦИАЛИЗАЦИЯ ---
-function init() {
+async function init() {
     log('Инициализация системы...');
     
     try {
         execSync('pkill -9 ladspeed', { stdio: 'ignore' });
     } catch (e) {}
 
-    if (!fs.existsSync(CONFIG.binDir)) fs.mkdirSync(CONFIG.binDir);
-    
+    // Сначала скачиваем бинарник
+    await ensureBinary();
+
     Object.values(CONFIG.files).forEach(file => {
         if (!fs.existsSync(file)) fs.writeFileSync(file, '');
         try { fs.chmodSync(file, '666'); } catch(e) {}
     });
 
-    if (!fs.existsSync(CONFIG.ladspeedBin)) {
-        log(`КРИТИЧЕСКАЯ ОШИБКА: Бинарник ${CONFIG.ladspeedBin} не найден!`, 'ERROR');
-        process.exit(1);
-    }
-
     try {
-        execSync(`chmod +x ${CONFIG.ladspeedBin}`);
+        // Диагностика архитектуры
+        const fileInfo = execSync(`file ${CONFIG.ladspeedBin}`).toString();
+        log(`Информация о бинарнике: ${fileInfo.trim()}`, 'DEBUG');
     } catch (e) {
-        log(`Не удалось установить chmod +x: ${e.message}`, 'WARN');
+        log(`Ошибка диагностики: ${e.message}`, 'WARN');
     }
 }
 
@@ -155,10 +218,11 @@ async function testConfig(line, port) {
 
         log(`[STEP 1] Запуск бинарника на порту ${port}...`, 'TRACE');
         
-        // Используем более надежный способ передачи длинных строк через кавычки
-        const proc = spawn(CONFIG.ladspeedBin, ['-p', port.toString(), '-config-line', line], {
+        const command = `"${CONFIG.ladspeedBin}" -p ${port} -config-line "${line.replace(/"/g, '\\"')}"`;
+        
+        const proc = spawn(command, [], {
             detached: true,
-            shell: false, // Отключаем shell, чтобы избежать двойного парсинга
+            shell: true, 
             stdio: ['pipe', 'pipe', 'pipe']
         });
 
@@ -168,7 +232,6 @@ async function testConfig(line, port) {
         const onData = (data) => {
             const str = data.toString();
             binaryLogs += str;
-            // Логируем все, что пишет бинарник, если там есть подозрение на ошибку
             if (str.toLowerCase().includes('error') || str.toLowerCase().includes('fail') || str.toLowerCase().includes('invalid')) {
                 log(`[BINARY LOG] ${str.trim()}`, 'DEBUG');
             }
@@ -197,8 +260,8 @@ async function testConfig(line, port) {
             if (!result.ok && result.error) {
                 log(`Диагностика неудачи: ${result.error}`, 'ERROR');
                 if (binaryLogs) {
-                    log('Полный лог бинарника перед ошибкой:', 'DEBUG');
-                    console.log(`\n${binaryLogs.trim()}\n`);
+                    log('Лог бинарника (последние 1000 симв):', 'DEBUG');
+                    console.log(`\n${binaryLogs.slice(-1000).trim()}\n`);
                 }
             }
 
@@ -220,14 +283,11 @@ async function testConfig(line, port) {
             if (isResolved) return;
             
             const duration = Date.now() - startTime;
-            // Если бинарник вышел слишком быстро (например, за 1 сек), значит он не запустился
-            if (duration < 2000) {
+            if (duration < 1500) {
                 log(`Бинарник мгновенно завершился (код: ${code}, время: ${duration}мс).`, 'ERROR');
                 if (binaryLogs) {
                     log('Вывод бинарника:', 'WARN');
                     console.log(`>>> ${binaryLogs.trim()}`);
-                } else {
-                    log('Бинарник завершился без какого-либо вывода в консоль.', 'WARN');
                 }
                 clearTimeout(startWait);
                 isResolved = true;
@@ -239,7 +299,7 @@ async function testConfig(line, port) {
 
 // --- MAIN ---
 async function main() {
-    init();
+    await init();
 
     const allConfigs = await fetchSubscription();
     const deadHashes = getHashesFromFile(CONFIG.files.dead);

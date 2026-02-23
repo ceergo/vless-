@@ -42,4 +42,3 @@ jobs:
 
       - name: Run subscription checker
         run: python main.py
-

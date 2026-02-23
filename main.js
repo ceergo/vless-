@@ -4,193 +4,192 @@ import time
 import subprocess
 import base64
 import re
+import signal
+import requests
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlparse, parse_qs
 
-# ================= CONFIGURATION =================
-# Ссылки для проверки (можно добавить свои)
-CHECK_URLS = [
-    "https://gemini.google.com/app?hl=ru",
-    "https://www.google.com"
-]
+# --- CONFIGURATION ---
+# Внешний источник стабильных конфигов
+REMOTE_STABLE_URL = "https://raw.githubusercontent.com/ceergo/parss/main/my_stable_configs.txt"
 
-# Настройки путей
-XRAY_PATH = "/usr/local/bin/xray"
-SPEEDTEST_PATH = "/usr/local/bin/librespeed-cli"
-LINKS_FILE = "links.txt"
-GEMINI_FILE = "gemini_ok.txt"
-GENERAL_FILE = "general_ok.txt"
+TARGET_URL = "https://gemini.google.com/app?hl=ru"
+CHECK_MARKER = "app"
+XRAY_BIN = "/usr/local/bin/xray"
 
-# Настройки потоков (лимиты GitHub)
-MAX_WORKERS = 8 
-START_PORT = 10001
-# =================================================
+INPUT_FILE = "links.txt"
+RESULT_GEMINI = "gemini_ok.txt"
+RESULT_GENERAL = "general_ok.txt"
 
-def decode_vmess(link):
-    try:
-        data = link.replace("vmess://", "")
-        # Исправление padding для base64
-        decoded = base64.b64decode(data + '=' * (-len(data) % 4)).decode('utf-8')
-        return json.loads(decoded)
-    except:
-        return None
+MAX_THREADS = 12
+START_PORT = 15000
 
-def generate_xray_config(link_data, port):
-    """Генерирует JSON конфиг для Xray с защитой DNS и uTLS"""
+def parse_link(link):
+    """Parses proxy link type and prepares for config generation"""
+    link = link.strip()
+    if not link: return None
+    proto = link.split("://")[0]
+    return {"protocol": proto, "raw": link}
+
+def generate_config(link_data, port):
+    """Generates Xray JSON config with uTLS and DNS leak protection"""
     config = {
         "log": {"loglevel": "none"},
+        "dns": {
+            "servers": ["1.1.1.1", "8.8.8.8", "localhost"],
+            "queryStrategy": "UseIPv4"
+        },
         "inbounds": [{
             "port": port,
             "listen": "127.0.0.1",
             "protocol": "socks",
-            "settings": {"udp": True}
+            "settings": {"udp": True},
+            "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}
         }],
-        "outbounds": [],
-        "dns": {
-            "servers": ["1.1.1.1", "8.8.8.8"]
-        }
+        "outbounds": [
+            {
+                "protocol": "freedom", 
+                "settings": {},
+                "streamSettings": {
+                    "sockopt": {"mark": 255},
+                    "tlsSettings": {"fingerprint": "chrome"}
+                }
+            }
+        ]
     }
-
-    # Логика разбора ссылки и формирования outbound
-    # (Упрощенная версия для примера, в реальности тут полный парсинг всех типов)
-    outbound = {
-        "protocol": "vless", # По умолчанию, меняется в зависимости от типа
-        "settings": {},
-        "streamSettings": {
-            "network": "tcp",
-            "security": "none",
-            "sockopt": {"mark": 255}
-        }
-    }
-    
-    # Добавление защиты DNS и Сниффинга в inbound
-    config["inbounds"][0]["sniffing"] = {
-        "enabled": True,
-        "destOverride": ["http", "tls"]
-    }
-
-    # Здесь должна быть логика заполнения настроек из link_data...
-    # Для краткости представим, что мы собрали объект outbound
-    config["outbounds"].append(outbound)
-    
     return config
 
 class ProxyChecker:
-    def __init__(self, link, id_num):
+    def __init__(self, link, idx):
         self.link = link
-        self.port = START_PORT + id_num
+        self.port = START_PORT + idx
         self.config_path = f"config_{self.port}.json"
-        self.process = None
+        self.proc = None
 
-    def start_xray(self):
-        # В реальном коде тут вызывается парсер и генератор конфига
-        # Для демо создадим болванку
-        conf = {"inbounds": [{"port": self.port, "protocol": "socks"}]} 
-        with open(self.config_path, 'w') as f:
-            json.dump(conf, f)
+    def start(self):
+        link_data = parse_link(self.link)
+        if not link_data: return False
         
-        # Запуск бинарника через sudo
-        self.process = subprocess.Popen(
-            ["sudo", XRAY_PATH, "-c", self.config_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        cfg = generate_config(link_data, self.port)
+        with open(self.config_path, "w") as f:
+            json.dump(cfg, f)
+        
+        # Start Xray core via sudo for root-level networking
+        self.proc = subprocess.Popen(
+            ["sudo", XRAY_BIN, "-c", self.config_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            preexec_fn=os.setsid
         )
-        time.sleep(2) # Даем время на запуск
+        time.sleep(2.5) # Wait for core initialization
+        return True
 
-    def stop_xray(self):
-        if self.process:
-            self.process.terminate()
-            subprocess.run(["sudo", "kill", "-9", str(self.process.pid)], stderr=subprocess.DEVNULL)
+    def test(self):
+        res = {"gemini": False, "speed": 0, "active": False}
+        proxy = f"socks5h://127.0.0.1:{self.port}"
+        
+        try:
+            # Step 1: Gemini Access Test
+            check = subprocess.run(
+                ["curl", "-sL", "--proxy", proxy, "--max-time", "12", TARGET_URL],
+                capture_output=True, text=True
+            )
+            if CHECK_MARKER in check.stdout.lower():
+                res["gemini"] = True
+                res["active"] = True
+            elif check.returncode == 0 and len(check.stdout) > 50:
+                res["active"] = True
+
+            # Step 2: Speed Test (1MB download)
+            if res["active"]:
+                speed_check = subprocess.run(
+                    ["curl", "-s", "--proxy", proxy, "-o", "/dev/null", "-w", "%{speed_download}", 
+                     "--max-time", "15", "https://speed.cloudflare.com/__down?bytes=1048576"],
+                    capture_output=True, text=True
+                )
+                try:
+                    res["speed"] = float(speed_check.stdout.strip()) / 1024 / 1024 # MB/s
+                except:
+                    res["speed"] = 0
+        except:
+            pass
+        return res
+
+    def stop(self):
+        if self.proc:
+            try:
+                # Terminate entire process group (sudo + xray)
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+            except:
+                pass
         if os.path.exists(self.config_path):
             os.remove(self.config_path)
 
-    def check_access(self):
-        """Проверка Gemini через curl с использованием прокси"""
-        try:
-            proxy = f"socks5h://127.0.0.1:{self.port}"
-            result = subprocess.run(
-                ["curl", "-s", "-L", "--proxy", proxy, "--max-time", "10", CHECK_URLS[0]],
-                capture_output=True, text=True
-            )
-            return "app" in result.stdout.lower()
-        except:
-            return False
-
-    def test_speed(self):
-        """Замер скорости 1MB через librespeed-cli"""
-        try:
-            # Команда замеряет скорость через наш локальный прокси
-            # --proxy должен поддерживаться бинарником или через переменные окружения
-            env = os.environ.copy()
-            env["http_proxy"] = f"http://127.0.0.1:{self.port}"
-            env["https_proxy"] = f"http://127.0.0.1:{self.port}"
-            
-            # Запуск замера (упрощенно)
-            start_t = time.time()
-            res = subprocess.run(
-                [SPEEDTEST_PATH, "--duration", "5", "--json"],
-                env=env, capture_output=True, text=True
-            )
-            duration = time.time() - start_t
-            return True if duration < 15 else False # Если скачал быстро
-        except:
-            return False
-
-def worker(task):
-    link, idx = task
-    checker = ProxyChecker(link, idx)
-    result = {"link": link, "gemini": False, "speed": False, "valid": False}
+def process_task(data):
+    link, i = data
+    chk = ProxyChecker(link, i)
+    status = {"link": link, "type": "dead"}
     
     try:
-        checker.start_xray()
-        if checker.check_access():
-            result["gemini"] = True
-            result["valid"] = True
-        
-        # Если прокси вообще дышит, проверяем скорость
-        if checker.test_speed():
-            result["speed"] = True
-            result["valid"] = True
+        if chk.start():
+            metrics = chk.test()
+            if metrics["gemini"] and metrics["speed"] > 0.1:
+                status["type"] = "gemini"
+            elif metrics["active"] and metrics["speed"] > 0.05:
+                status["type"] = "general"
     finally:
-        checker.stop_xray()
+        chk.stop()
     
-    return result
+    return status
 
 def main():
-    if not os.path.exists(LINKS_FILE):
-        print("Файл links.txt не найден!")
+    # 1. Fetch remote stable configs
+    print(f"Fetching remote configs from {REMOTE_STABLE_URL}...")
+    remote_links = []
+    try:
+        r = requests.get(REMOTE_STABLE_URL, timeout=15)
+        if r.status_code == 200:
+            remote_links = [l.strip() for l in r.text.splitlines() if l.strip()]
+            print(f"Successfully fetched {len(remote_links)} remote links.")
+    except Exception as e:
+        print(f"Warning: Failed to fetch remote file: {e}")
+
+    # 2. Read local links
+    local_links = []
+    if os.path.exists(INPUT_FILE):
+        with open(INPUT_FILE, "r") as f:
+            local_links = [line.strip() for line in f if line.strip()]
+        print(f"Read {len(local_links)} local links.")
+
+    # Merge sources and deduplicate
+    all_links = list(set(local_links + remote_links))
+    print(f"Total unique links to check: {len(all_links)}")
+
+    if not all_links:
+        print("No links found to process.")
         return
 
-    with open(LINKS_FILE, 'r') as f:
-        raw_links = list(set([l.strip() for l in f if l.strip()]))
+    # 3. Parallel Processing
+    with ThreadPoolExecutor(max_workers=MAX_THREADS) as pool:
+        results = list(pool.map(process_task, [(l, i) for i, l in enumerate(all_links)]))
 
-    print(f"Запуск проверки {len(raw_links)} ссылок в {MAX_WORKERS} потоков...")
+    # Sort results into categories
+    gemini_ok = [r["link"] for r in results if r["type"] == "gemini"]
+    general_ok = [r["link"] for r in results if r["type"] == "general"]
 
-    tasks = [(link, i) for i, link in enumerate(raw_links)]
+    # 4. Save results
+    with open(RESULT_GEMINI, "w") as f: 
+        f.write("\n".join(sorted(set(gemini_ok))))
     
-    gemini_list = []
-    general_list = []
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        results = list(executor.map(worker, tasks))
-
-    for res in results:
-        if res["gemini"] and res["speed"]:
-            gemini_list.append(res["link"])
-        elif res["valid"]:
-            general_list.append(res["link"])
-
-    # Запись результатов
-    with open(GEMINI_FILE, 'w') as f:
-        f.write("\n".join(gemini_list))
+    with open(RESULT_GENERAL, "w") as f: 
+        f.write("\n".join(sorted(set(general_ok))))
     
-    with open(GENERAL_FILE, 'w') as f:
-        f.write("\n".join(general_list))
+    # Update main links.txt with only working configurations
+    with open(INPUT_FILE, "w") as f: 
+        f.write("\n".join(sorted(set(gemini_ok + general_ok))))
 
-    # Обновление основного файла (удаление мертвых)
-    with open(LINKS_FILE, 'w') as f:
-        f.write("\n".join(gemini_list + general_list))
-
-    print("Проверка завершена. Списки обновлены.")
+    print(f"--- Processing Complete ---")
+    print(f"Gemini-Ready (High Speed): {len(gemini_ok)}")
+    print(f"General-Working: {len(general_ok)}")
+    print(f"Dead/Filtered: {len(all_links) - len(gemini_ok) - len(general_ok)}")
 
 if __name__ == "__main__":
     main()

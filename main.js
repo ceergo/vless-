@@ -115,7 +115,7 @@ async function checkGemini(port) {
         const response = await axios.get(CONFIG.geminiUrl, {
             httpAgent: agent,
             httpsAgent: agent,
-            timeout: 12000, // Увеличили таймаут для тяжелых конфигов
+            timeout: 15000, 
             validateStatus: null,
             maxRedirects: 10,
             headers: {
@@ -150,14 +150,25 @@ async function testConfig(line, port) {
 
         log(`[STEP 1] Запуск бинарника для порта ${port}...`, 'TRACE');
         
+        // Передаем аргументы списком, чтобы избежать проблем с кавычками в shell
         const proc = spawn(CONFIG.ladspeedBin, ['-p', port.toString(), '-config-line', line], {
             detached: true,
             stdio: ['pipe', 'pipe', 'pipe']
         });
 
         let binaryLogs = '';
-        proc.stderr.on('data', (data) => binaryLogs += data.toString());
-        proc.stdout.on('data', (data) => binaryLogs += data.toString());
+        
+        // Захват логов в реальном времени
+        const onData = (data) => {
+            const str = data.toString();
+            binaryLogs += str;
+            if (str.toLowerCase().includes('error') || str.toLowerCase().includes('fail') || str.toLowerCase().includes('fatal')) {
+                log(`[BINARY] ${str.trim()}`, 'ERROR');
+            }
+        };
+
+        proc.stderr.on('data', onData);
+        proc.stdout.on('data', onData);
 
         const cleanup = () => {
             try { 
@@ -169,23 +180,21 @@ async function testConfig(line, port) {
 
         let isResolved = false;
 
+        // Даем бинарнику 5 секунд на старт и только потом делаем запрос
         const startWait = setTimeout(async () => {
             if (isResolved) return;
 
-            // Перед запросом проверим, не вылетел ли бинарник
-            if (binaryLogs.toLowerCase().includes('error') || binaryLogs.toLowerCase().includes('fatal')) {
-                log(`Обнаружена ошибка в логах бинарника до начала теста:`, 'WARN');
-                console.log(`>>> ${binaryLogs.trim()}`);
+            log(`[STEP 1.5] Пауза на прогрев бинарника завершена. Проверка логов...`, 'DEBUG');
+            if (binaryLogs) {
+                console.log(`--- ТЕКУЩИЙ ЛОГ БИНАРНИКА ---\n${binaryLogs.trim()}\n--- КОНЕЦ ЛОГА ---`);
+            } else {
+                log('Бинарник ничего не вывел в консоль (молчит).', 'WARN');
             }
 
             const result = await checkGemini(port);
             
             if (!result.ok && result.error) {
                 log(`Диагностика неудачи: ${result.error}`, 'ERROR');
-                if (binaryLogs) {
-                    log('Последние сообщения от ladspeed:', 'DEBUG');
-                    console.log(binaryLogs.split('\n').slice(-5).join('\n'));
-                }
             }
 
             cleanup();
@@ -203,8 +212,12 @@ async function testConfig(line, port) {
         });
 
         proc.on('exit', (code) => {
-            if (!isResolved && code !== 0 && code !== null) {
-                log(`Бинарник завершился с кодом ${code} до завершения теста.`, 'WARN');
+            if (!isResolved) {
+                log(`Бинарник внезапно упал с кодом ${code}`, 'ERROR');
+                // Если он упал, не ждем таймаута
+                clearTimeout(startWait);
+                isResolved = true;
+                resolve({ ok: false, error: `Binary exited with code ${code}`, logs: binaryLogs });
             }
         });
     });

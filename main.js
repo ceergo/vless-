@@ -22,7 +22,7 @@ const CONFIG = {
     },
     binDir: path.join(__dirname, 'bin'),
     ladspeedBin: path.join(__dirname, 'bin', 'ladspeed'),
-    // Ссылки на бинарники (версия v0.6.0 как пример стабильной)
+    // Прямые ссылки на релизы для x64 и ARM64
     binSources: {
         'x64': 'https://github.com/uS-S/ladspeed/releases/download/v0.6.0/ladspeed-linux-amd64',
         'arm64': 'https://github.com/uS-S/ladspeed/releases/download/v0.6.0/ladspeed-linux-arm64'
@@ -45,61 +45,47 @@ function getRandomPort() {
 }
 
 /**
- * Загрузка файла по HTTPS
+ * Компактная загрузка файла с поддержкой редиректов
  */
 async function downloadFile(url, dest) {
     return new Promise((resolve, reject) => {
-        const file = fs.createWriteStream(dest);
-        https.get(url, (response) => {
-            if (response.statusCode === 302 || response.statusCode === 301) {
-                // Обработка редиректов (важно для GitHub Releases)
-                downloadFile(response.headers.location, dest).then(resolve).catch(reject);
-                return;
+        https.get(url, (res) => {
+            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                return downloadFile(res.headers.location, dest).then(resolve).catch(reject);
             }
-            if (response.statusCode !== 200) {
-                reject(new Error(`Failed to download: ${response.statusCode}`));
-                return;
-            }
-            response.pipe(file);
-            file.on('finish', () => {
-                file.close();
-                resolve();
-            });
-        }).on('error', (err) => {
-            fs.unlink(dest, () => reject(err));
-        });
+            if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
+            
+            const stream = fs.createWriteStream(dest);
+            res.pipe(stream);
+            stream.on('finish', () => stream.close(resolve));
+            stream.on('error', (err) => { fs.unlink(dest, () => reject(err)); });
+        }).on('error', reject);
     });
 }
 
 /**
- * Гарантирует наличие рабочего бинарника
+ * Обеспечивает наличие рабочего бинарника
  */
 async function ensureBinary() {
     if (!fs.existsSync(CONFIG.binDir)) fs.mkdirSync(CONFIG.binDir, { recursive: true });
 
-    const arch = process.arch; // 'x64' или 'arm64'
-    const url = CONFIG.binSources[arch] || CONFIG.binSources['x64'];
+    const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
+    const url = CONFIG.binSources[arch];
     
-    log(`Проверка бинарника для архитектуры: ${arch}...`, 'DEBUG');
-
-    // Если файл есть, проверяем, не "пустышка" ли он (размер > 1MB)
-    if (fs.existsSync(CONFIG.ladspeedBin)) {
-        const stats = fs.statSync(CONFIG.ladspeedBin);
-        if (stats.size > 1024 * 1024) {
-            log('Рабочий бинарник уже на месте.', 'SUCCESS');
-            return;
-        }
-        log('Обнаружен некорректный бинарник (пустой файл), удаляю...', 'WARN');
-        fs.unlinkSync(CONFIG.ladspeedBin);
+    // Проверка: если файл есть и он не пустой (>1MB), пропускаем загрузку
+    if (fs.existsSync(CONFIG.ladspeedBin) && fs.statSync(CONFIG.ladspeedBin).size > 1024 * 1024) {
+        log(`Бинарник (${arch}) уже готов.`, 'SUCCESS');
+        return;
     }
 
-    log(`Загрузка актуального бинарника из ${url}...`);
+    log(`Загрузка бинарника (${arch}) из GitHub...`);
     try {
+        if (fs.existsSync(CONFIG.ladspeedBin)) fs.unlinkSync(CONFIG.ladspeedBin);
         await downloadFile(url, CONFIG.ladspeedBin);
         fs.chmodSync(CONFIG.ladspeedBin, '755');
-        log('Бинарник успешно загружен и подготовлен.', 'SUCCESS');
+        log('Бинарник успешно скачан и подготовлен.', 'SUCCESS');
     } catch (e) {
-        log(`Не удалось скачать бинарник: ${e.message}`, 'ERROR');
+        log(`Ошибка загрузки: ${e.message}`, 'ERROR');
         process.exit(1);
     }
 }
@@ -112,7 +98,7 @@ async function init() {
         execSync('pkill -9 ladspeed', { stdio: 'ignore' });
     } catch (e) {}
 
-    // Сначала скачиваем бинарник
+    // Гарантируем наличие бинарника перед созданием файлов
     await ensureBinary();
 
     Object.values(CONFIG.files).forEach(file => {
@@ -121,11 +107,10 @@ async function init() {
     });
 
     try {
-        // Диагностика архитектуры
         const fileInfo = execSync(`file ${CONFIG.ladspeedBin}`).toString();
-        log(`Информация о бинарнике: ${fileInfo.trim()}`, 'DEBUG');
+        log(`Диагностика: ${fileInfo.trim()}`, 'DEBUG');
     } catch (e) {
-        log(`Ошибка диагностики: ${e.message}`, 'WARN');
+        log(`Диагностика не удалась: ${e.message}`, 'WARN');
     }
 }
 

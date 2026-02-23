@@ -1,6 +1,7 @@
 /**
  * Ultra-Light Gemini & Xray Checker (GitHub Ready)
  * Senior Coding Standard: Robustness, Logging, Idempotency.
+ * 23.02.2026: Добавлена глубокая диагностика шагов проверки.
  */
 
 const fs = require('fs');
@@ -28,7 +29,7 @@ const CONFIG = {
 // --- ЛОГИРОВАНИЕ ---
 const log = (msg, type = 'INFO') => {
     const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19);
-    const colors = { INFO: '\x1b[36m', SUCCESS: '\x1b[32m', WARN: '\x1b[33m', ERROR: '\x1b[31m', DEBUG: '\x1b[90m' };
+    const colors = { INFO: '\x1b[36m', SUCCESS: '\x1b[32m', WARN: '\x1b[33m', ERROR: '\x1b[31m', DEBUG: '\x1b[90m', TRACE: '\x1b[95m' };
     console.log(`${colors[type] || ''}[${timestamp}] [${type}] ${msg}\x1b[0m`);
 };
 
@@ -36,10 +37,8 @@ const log = (msg, type = 'INFO') => {
 function init() {
     log('Инициализация системы...');
     
-    // Чистим старые процессы бинарника перед стартом, чтобы порт 30005 был свободен
     try {
         execSync('pkill -9 ladspeed', { stdio: 'ignore' });
-        log('Старые процессы ladspeed зачищены.', 'DEBUG');
     } catch (e) {}
 
     if (!fs.existsSync(CONFIG.binDir)) fs.mkdirSync(CONFIG.binDir);
@@ -56,7 +55,6 @@ function init() {
 
     try {
         execSync(`chmod +x ${CONFIG.ladspeedBin}`);
-        log('Права на выполнение ladspeed установлены.', 'DEBUG');
     } catch (e) {
         log(`Не удалось установить chmod +x: ${e.message}`, 'WARN');
     }
@@ -65,7 +63,7 @@ function init() {
 // --- УМНЫЙ ПАРСИНГ ---
 async function fetchSubscription() {
     const url = process.env.SUB_URL || CONFIG.defaultSubUrl;
-    log(`Загрузка подписки из: ${url}`);
+    log(`Загрузка подписки: ${url}`);
     
     return new Promise((resolve, reject) => {
         https.get(url, (res) => {
@@ -76,12 +74,11 @@ async function fetchSubscription() {
                 if (!data.includes('://') && data.length > 20) {
                     try {
                         content = Buffer.from(data, 'base64').toString('utf-8');
-                        log('Обнаружен формат Base64, декодирование успешно.');
+                        log('Декодирование Base64 успешно.');
                     } catch (e) {
-                        log('Не удалось декодировать Base64, используем как текст.', 'WARN');
+                        log('Base64 ошибка, читаем как текст.', 'WARN');
                     }
                 }
-                // УНИКАЛИЗАЦИЯ: Оставляем только уникальные строки
                 const lines = [...new Set(content.split(/\r?\n/)
                     .map(l => l.trim())
                     .filter(l => l.includes('://')))];
@@ -107,36 +104,52 @@ function addToDead(configLine) {
     fs.appendFileSync(CONFIG.files.dead, hash + '\n');
 }
 
-// --- ПРОВЕРКА ГЕМИНИ ---
+// --- ПРОВЕРКА ГЕМИНИ (С ГЛУБОКИМ ЛОГИРОВАНИЕМ) ---
 async function checkGemini(port) {
-    const agent = new HttpProxyAgent(`http://127.0.0.1:${port}`);
+    const proxyUrl = `http://127.0.0.1:${port}`;
+    const agent = new HttpProxyAgent(proxyUrl);
+    
+    log(`[STEP 2] HTTP Запрос к Gemini через ${proxyUrl}...`, 'TRACE');
+
     try {
         const response = await axios.get(CONFIG.geminiUrl, {
             httpAgent: agent,
             httpsAgent: agent,
-            timeout: 10000,
+            timeout: 12000, // Увеличили таймаут для тяжелых конфигов
             validateStatus: null,
-            maxRedirects: 5,
+            maxRedirects: 10,
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5'
             }
         });
 
-        const finalUrl = response.request.res.responseUrl || '';
+        const finalUrl = response.request.res.responseUrl || response.config.url || '';
+        log(`[STEP 3] HTTP Ответ получен. Status: ${response.status}, Final URL: ${finalUrl}`, 'TRACE');
+
         if (finalUrl.includes('/app')) {
-            return { ok: true, url: finalUrl };
+            return { ok: true, url: finalUrl, status: response.status };
         }
-        return { ok: false, url: finalUrl };
+        
+        return { ok: false, url: finalUrl, status: response.status, msg: 'Маркер /app не найден в редиректе' };
     } catch (err) {
-        return { ok: false, error: err.message };
+        let errMsg = err.message;
+        if (err.code === 'ECONNREFUSED') errMsg = `Порт ${port} закрыт (Бинарник не прокинул туннель)`;
+        if (err.code === 'ETIMEDOUT' || err.code === 'ECONNABORTED') errMsg = `Таймаут соединения через прокси`;
+        
+        return { ok: false, error: errMsg, code: err.code };
     }
 }
 
 // --- ТЕСТ КОНФИГА ---
 async function testConfig(line, port) {
     return new Promise((resolve) => {
-        log(`[FULL_CONFIG] Передаем в бинарник: ${line}`, 'DEBUG');
+        // Очистка порта
+        try { execSync(`fuser -k ${port}/tcp`, { stdio: 'ignore' }); } catch(e) {}
 
+        log(`[STEP 1] Запуск бинарника для порта ${port}...`, 'TRACE');
+        
         const proc = spawn(CONFIG.ladspeedBin, ['-p', port.toString(), '-config-line', line], {
             detached: true,
             stdio: ['pipe', 'pipe', 'pipe']
@@ -152,25 +165,33 @@ async function testConfig(line, port) {
             } catch(e) { 
                 try { proc.kill('SIGKILL'); } catch(e2) {}
             }
-            // Дополнительная гарантия очистки порта
-            try { execSync(`fuser -k ${port}/tcp`, { stdio: 'ignore' }); } catch(e) {}
         };
 
         let isResolved = false;
 
         const startWait = setTimeout(async () => {
             if (isResolved) return;
-            
+
+            // Перед запросом проверим, не вылетел ли бинарник
+            if (binaryLogs.toLowerCase().includes('error') || binaryLogs.toLowerCase().includes('fatal')) {
+                log(`Обнаружена ошибка в логах бинарника до начала теста:`, 'WARN');
+                console.log(`>>> ${binaryLogs.trim()}`);
+            }
+
             const result = await checkGemini(port);
             
-            if (!result.ok && result.error && result.error.includes('ECONNREFUSED')) {
-                log(`Бинарник не открыл порт ${port}. Лог: ${binaryLogs.substring(0, 100).replace(/\n/g, ' ')}...`, 'ERROR');
+            if (!result.ok && result.error) {
+                log(`Диагностика неудачи: ${result.error}`, 'ERROR');
+                if (binaryLogs) {
+                    log('Последние сообщения от ladspeed:', 'DEBUG');
+                    console.log(binaryLogs.split('\n').slice(-5).join('\n'));
+                }
             }
 
             cleanup();
             isResolved = true;
             resolve(result);
-        }, 7000); // 7 секунд на запуск и проксирование
+        }, 8000); 
 
         proc.on('error', (err) => {
             if (isResolved) return;
@@ -183,9 +204,7 @@ async function testConfig(line, port) {
 
         proc.on('exit', (code) => {
             if (!isResolved && code !== 0 && code !== null) {
-                clearTimeout(startWait);
-                isResolved = true;
-                resolve({ ok: false, error: `Бинарник упал с кодом ${code}` });
+                log(`Бинарник завершился с кодом ${code} до завершения теста.`, 'WARN');
             }
         });
     });
@@ -195,57 +214,50 @@ async function testConfig(line, port) {
 async function main() {
     init();
 
-    // 1. Получаем уникальный список конфигов
     const allConfigs = await fetchSubscription();
-    
-    // 2. Загружаем историю
     const deadHashes = getHashesFromFile(CONFIG.files.dead);
     const geminiHashes = getHashesFromFile(CONFIG.files.gemini);
     
-    // 3. ФИЛЬТРАЦИЯ (Исключаем то, что уже проверяли когда-либо)
     const tasks = allConfigs.filter(line => {
         const hash = crypto.createHash('md5').update(line).digest('hex');
         return !deadHashes.has(hash) && !geminiHashes.has(hash);
     });
 
-    log(`Всего в подписке: ${allConfigs.length}`);
-    log(`Пропуск проверенных: ${allConfigs.length - tasks.length}`);
-    log(`К проверке сейчас: ${tasks.length}`);
+    log(`Подписка: ${allConfigs.length} | К проверке: ${tasks.length}`);
 
     if (tasks.length === 0) {
-        log('Новых ссылок для проверки не найдено.', 'SUCCESS');
+        log('Новых конфигов нет. Выход.', 'SUCCESS');
         process.exit(0);
     }
 
-    // Читаем текущие Gemini, чтобы дополнять файл
     let currentGemini = fs.readFileSync(CONFIG.files.gemini, 'utf-8').split('\n').filter(Boolean);
 
-    // 4. ОДИНАРНЫЙ ПРОХОД (Strict Loop)
     for (let i = 0; i < tasks.length; i++) {
         const line = tasks[i];
-        log(`[${i + 1}/${tasks.length}] Проверка...`);
+        log(`[${i + 1}/${tasks.length}] === ТЕСТ КОНФИГА ===`);
 
         const res = await testConfig(line, 30005);
 
         if (res.ok) {
-            log(`[UP] Gemini найден!`, 'SUCCESS');
+            log(`[RESULT] SUCCESS! Доступ к Gemini подтвержден.`, 'SUCCESS');
             currentGemini.push(line);
-            // Сохраняем прогресс сразу
             fs.writeFileSync(CONFIG.files.gemini, [...new Set(currentGemini)].join('\n'));
         } else {
-            log(`[DOWN] Мимо: ${res.url || res.error || 'Check failed'}`, 'WARN');
+            const reason = res.error || res.msg || `Status ${res.status}`;
+            log(`[RESULT] FAILED. Причина: ${reason}`, 'WARN');
             addToDead(line);
         }
     }
 
-    log(`Проверка завершена. Найдено новых: ${currentGemini.length - geminiHashes.size}`, 'SUCCESS');
+    log(`Проверка окончена. Итого живых: ${currentGemini.length}`, 'SUCCESS');
     
-    // ГАРАНТИРОВАННОЕ ЗАВЕРШЕНИЕ
-    log('Форсированный выход...');
-    setTimeout(() => process.exit(0), 500);
+    setTimeout(() => {
+        try { execSync('pkill -9 ladspeed', { stdio: 'ignore' }); } catch(e) {}
+        process.kill(process.pid, 'SIGKILL'); 
+    }, 1000);
 }
 
 main().catch(e => {
-    log(`Глобальный сбой: ${e.message}`, 'ERROR');
+    log(`Критический сбой: ${e.message}`, 'ERROR');
     process.exit(1);
 });

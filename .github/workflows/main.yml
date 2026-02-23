@@ -1,56 +1,29 @@
-name: Gemini Proxy Checker
+#!/bin/bash
+# Скрипт установки бинарников для GitHub Actions
 
-on:
-  # Позволяет запускать вручную из интерфейса GitHub
-  workflow_dispatch:
-  # Позволяет запускать через API (от твоего бота)
-  repository_dispatch:
-    types: [run_proxy_check]
+set -e
 
-jobs:
-  check:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write # Даем права на запись изменений в файлы txt
+echo "Установка системных зависимостей..."
+sudo apt-get update && sudo apt-get install -y wget curl unzip jq
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+# 1. Установка Xray Core
+echo "Скачивание Xray Core..."
+XRAY_VERSION=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+wget -q "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" -O xray.zip
+sudo unzip -o xray.zip -d /usr/local/bin
+sudo chmod +x /usr/local/bin/xray
+rm xray.zip
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
+# 2. Установка Librespeed-CLI
+echo "Скачивание Librespeed-CLI..."
+# Берем стабильную версию
+wget -q "https://github.com/librespeed/speedtest-cli/releases/download/v1.0.10/librespeed-cli_1.0.10_linux_amd64.tar.gz" -O librespeed.tar.gz
+sudo tar -xzf librespeed.tar.gz -C /usr/local/bin
+sudo chmod +x /usr/local/bin/librespeed-cli
+rm librespeed.tar.gz
 
-      - name: Install dependencies
-        run: |
-          if [ ! -f package.json ]; then npm init -y; fi
-          npm install axios http-proxy-agent
+echo "Проверка бинарников..."
+/usr/local/bin/xray -version
+/usr/local/bin/librespeed-cli --version
 
-      - name: Prepare Binaries
-        run: |
-          # Создаем папку если её нет
-          mkdir -p bin
-          # Проверяем, существует ли бинарник. Если нет - выводим предупреждение.
-          if [ ! -f bin/ladspeed ]; then
-            echo "WARNING: bin/ladspeed not found! Creating a dummy for debug or you should upload it."
-            # Здесь можно добавить curl для скачивания реального бинарника, если он лежит в релизах
-            touch bin/ladspeed 
-          fi
-          chmod +x bin/ladspeed
-          # Выводим текущий путь для отладки
-          pwd
-          ls -R bin/
-
-      - name: Run Checker
-        run: sudo node main.js
-        env:
-          SUB_URL: ${{ github.event.client_payload.sub_url || 'ВАША_ДЕФОЛТНАЯ_ССЫЛКА' }}
-
-      - name: Commit and Push results
-        run: |
-          git config --global user.name "GeminiBot"
-          git config --global user.email "bot@gemini.check"
-          git add gemini.txt general.txt dead.txt || true
-          git commit -m "Auto-update proxy lists [skip ci]" || echo "No changes to commit"
-          git push
+echo "Все бинарники установлены успешно с правами Root."

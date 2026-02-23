@@ -2,7 +2,7 @@ import os, json, time, subprocess, base64, signal, requests, re
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse, parse_qs, unquote
 
-REMOTE_STABLE_URL = "https://raw.githubusercontent.com/ceergo/parss/main/my_stable_configs.txt"
+REMOTE_STABLE_URL = "vmess://ewogICAgImFkZCI6ICIxODYuMTkwLjIxNS43NSIsCiAgICAiYWlkIjogMSwKICAgICJob3N0IjogIjE4Ni4xOTAuMjE1Ljc1IiwKICAgICJpZCI6ICIwM2ZjYzYxOC1iOTNkLTY3OTYtNmFlZC04YTM4Yzk3NWQ1ODEiLAogICAgIm5ldCI6ICJ3cyIsCiAgICAicGF0aCI6ICJsaW5rdndzIiwKICAgICJwb3J0IjogNDQzLAogICAgInBzIjogIvCfh6jwn4etQ0gtMTg2LjE5MC4yMTUuNzUtNzgwOSIsCiAgICAidGxzIjogInRscyIsCiAgICAidHlwZSI6ICJhdXRvIiwKICAgICJzZWN1cml0eSI6ICJhdXRvIiwKICAgICJza2lwLWNlcnQtdmVyaWZ5IjogdHJ1ZSwKICAgICJzbmkiOiAiIgp9"
 TARGET_URL = "https://gemini.google.com/app?hl=ru"
 CHECK_MARKER = "app"
 XRAY_BIN = "/usr/local/bin/xray"

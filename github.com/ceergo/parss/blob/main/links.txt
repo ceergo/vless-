@@ -1,1 +1,0 @@
-https://raw.githubusercontent.com/ceergo/parss/refs/heads/main/my_stable_configs.txt

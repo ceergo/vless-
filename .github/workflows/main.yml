@@ -21,17 +21,29 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          pip install requests
 
-      - name: Setup Binaries (Root access)
+      - name: Setup Binaries (Root Access)
         run: |
-          # Даем права самому скрипту установки и запускаем его
-          chmod +x install.sh
-          ./install.sh
+          sudo apt-get update && sudo apt-get install -y wget curl unzip jq
+          
+          echo "Installing Xray..."
+          XRAY_TAG=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+          wget -q "https://github.com/XTLS/Xray-core/releases/download/${XRAY_TAG}/Xray-linux-64.zip" -O xray.zip
+          sudo unzip -o xray.zip -d /usr/local/bin
+          sudo chmod +x /usr/local/bin/xray
+          rm xray.zip
 
-      - name: Run Proxy Checker with Sudo
+          echo "Installing Librespeed..."
+          wget -q "https://github.com/librespeed/speedtest-cli/releases/download/v1.0.10/librespeed-cli_1.0.10_linux_amd64.tar.gz" -O ls.tar.gz
+          sudo tar -xzf ls.tar.gz -C /usr/local/bin
+          sudo chmod +x /usr/local/bin/librespeed-cli
+          rm ls.tar.gz
+
+      - name: Run Proxy Checker
         run: |
-          # Запускаем основной скрипт от имени суперпользователя
+          touch links.txt
           sudo python3 main.py
 
       - name: Commit and push changes
@@ -39,5 +51,5 @@ jobs:
           git config --local user.email "actions@github.com"
           git config --local user.name "GitHub Actions"
           git add .
-          git commit -m "Update proxy lists [skip ci]" || echo "No changes to commit"
+          git commit -m "Sync with remote stable configs and update results [skip ci]" || echo "No changes to commit"
           git push

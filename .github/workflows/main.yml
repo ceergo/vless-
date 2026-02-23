@@ -29,8 +29,18 @@ jobs:
 
       - name: Prepare Binaries
         run: |
+          # Создаем папку если её нет
           mkdir -p bin
-          chmod +x bin/ladspeed || true
+          # Проверяем, существует ли бинарник. Если нет - выводим предупреждение.
+          if [ ! -f bin/ladspeed ]; then
+            echo "WARNING: bin/ladspeed not found! Creating a dummy for debug or you should upload it."
+            # Здесь можно добавить curl для скачивания реального бинарника, если он лежит в релизах
+            touch bin/ladspeed 
+          fi
+          chmod +x bin/ladspeed
+          # Выводим текущий путь для отладки
+          pwd
+          ls -R bin/
 
       - name: Run Checker
         run: sudo node main.js

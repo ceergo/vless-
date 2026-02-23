@@ -5,7 +5,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const https = require('https');
 const crypto = require('crypto');
 const axios = require('axios');
@@ -13,7 +13,6 @@ const { HttpProxyAgent } = require('http-proxy-agent');
 
 // --- КОНФИГУРАЦИЯ ---
 const CONFIG = {
-    // Твоя реальная ссылка на подписку
     defaultSubUrl: 'https://raw.githubusercontent.com/ceergo/parss/refs/heads/main/my_stable_configs.txt',
     files: {
         gemini: path.join(__dirname, 'gemini.txt'),
@@ -37,11 +36,16 @@ const log = (msg, type = 'INFO') => {
 function init() {
     log('Инициализация системы...');
     
+    // Чистим старые процессы бинарника перед стартом, чтобы порт 30005 был свободен
+    try {
+        execSync('pkill -9 ladspeed', { stdio: 'ignore' });
+        log('Старые процессы ladspeed зачищены.', 'DEBUG');
+    } catch (e) {}
+
     if (!fs.existsSync(CONFIG.binDir)) fs.mkdirSync(CONFIG.binDir);
     
     Object.values(CONFIG.files).forEach(file => {
         if (!fs.existsSync(file)) fs.writeFileSync(file, '');
-        // Даем права на чтение/запись всем, чтобы git мог закомитить из-под root
         try { fs.chmodSync(file, '666'); } catch(e) {}
     });
 
@@ -49,11 +53,13 @@ function init() {
         log(`КРИТИЧЕСКАЯ ОШИБКА: Бинарник ${CONFIG.ladspeedBin} не найден!`, 'ERROR');
         process.exit(1);
     }
-    
+
     try {
-        const uid = process.getuid();
-        if (uid !== 0) log('Запуск не от ROOT. Работа с DNS может быть ограничена.', 'WARN');
-    } catch (e) {}
+        execSync(`chmod +x ${CONFIG.ladspeedBin}`);
+        log('Права на выполнение ladspeed установлены.', 'DEBUG');
+    } catch (e) {
+        log(`Не удалось установить chmod +x: ${e.message}`, 'WARN');
+    }
 }
 
 // --- УМНЫЙ ПАРСИНГ ---
@@ -67,7 +73,6 @@ async function fetchSubscription() {
             res.on('data', chunk => data += chunk);
             res.on('end', () => {
                 let content = data;
-                // Проверяем, не Base64 ли это
                 if (!data.includes('://') && data.length > 20) {
                     try {
                         content = Buffer.from(data, 'base64').toString('utf-8');
@@ -76,9 +81,10 @@ async function fetchSubscription() {
                         log('Не удалось декодировать Base64, используем как текст.', 'WARN');
                     }
                 }
-                const lines = content.split(/\r?\n/)
+                // УНИКАЛИЗАЦИЯ: Оставляем только уникальные строки
+                const lines = [...new Set(content.split(/\r?\n/)
                     .map(l => l.trim())
-                    .filter(l => l.includes('://'));
+                    .filter(l => l.includes('://')))];
                 resolve(lines);
             });
         }).on('error', reject);
@@ -89,11 +95,11 @@ async function fetchSubscription() {
 function getHashesFromFile(filePath) {
     if (!fs.existsSync(filePath)) return new Set();
     const data = fs.readFileSync(filePath, 'utf-8');
-    return new Set(data.split('\n').filter(Boolean).map(line => {
-        // Если это файл dead.txt, там лежат чистые хеши. Если gemini.txt - там ссылки, нужно хешировать.
-        if (filePath.endsWith('dead.txt')) return line.trim();
-        return crypto.createHash('md5').update(line.trim()).digest('hex');
-    }));
+    const lines = data.split('\n').map(l => l.trim()).filter(Boolean);
+    
+    if (filePath.endsWith('dead.txt')) return new Set(lines);
+    
+    return new Set(lines.map(line => crypto.createHash('md5').update(line).digest('hex')));
 }
 
 function addToDead(configLine) {
@@ -133,7 +139,7 @@ async function testConfig(line, port) {
 
         const proc = spawn(CONFIG.ladspeedBin, ['-p', port.toString(), '-config-line', line], {
             detached: true,
-            stdio: ['ignore', 'pipe', 'pipe']
+            stdio: ['pipe', 'pipe', 'pipe']
         });
 
         let binaryLogs = '';
@@ -144,28 +150,31 @@ async function testConfig(line, port) {
             try { 
                 process.kill(-proc.pid, 'SIGKILL'); 
             } catch(e) { 
-                proc.kill('SIGKILL'); 
+                try { proc.kill('SIGKILL'); } catch(e2) {}
             }
+            // Дополнительная гарантия очистки порта
+            try { execSync(`fuser -k ${port}/tcp`, { stdio: 'ignore' }); } catch(e) {}
         };
 
         let isResolved = false;
 
         const startWait = setTimeout(async () => {
             if (isResolved) return;
+            
             const result = await checkGemini(port);
             
             if (!result.ok && result.error && result.error.includes('ECONNREFUSED')) {
-                log(`Бинарник не открыл порт 30005. Полный лог бинарника:\n${binaryLogs}`, 'ERROR');
+                log(`Бинарник не открыл порт ${port}. Лог: ${binaryLogs.substring(0, 100).replace(/\n/g, ' ')}...`, 'ERROR');
             }
 
             cleanup();
             isResolved = true;
             resolve(result);
-        }, 5000);
+        }, 7000); // 7 секунд на запуск и проксирование
 
         proc.on('error', (err) => {
             if (isResolved) return;
-            log(`Ошибка старта бинарника: ${err.message}`, 'ERROR');
+            log(`КРИТИЧЕСКАЯ ОШИБКА SPAWN: ${err.message}`, 'ERROR');
             clearTimeout(startWait);
             cleanup();
             isResolved = true;
@@ -173,8 +182,11 @@ async function testConfig(line, port) {
         });
 
         proc.on('exit', (code) => {
-            if (isResolved || code === null || code === 0) return;
-            log(`Бинарник неожиданно завершился с кодом ${code}. Лог:\n${binaryLogs}`, 'WARN');
+            if (!isResolved && code !== 0 && code !== null) {
+                clearTimeout(startWait);
+                isResolved = true;
+                resolve({ ok: false, error: `Бинарник упал с кодом ${code}` });
+            }
         });
     });
 }
@@ -183,64 +195,57 @@ async function testConfig(line, port) {
 async function main() {
     init();
 
-    // Загружаем список из подписки
-    const incomingConfigs = await fetchSubscription();
+    // 1. Получаем уникальный список конфигов
+    const allConfigs = await fetchSubscription();
     
-    // Загружаем хеши уже известных "мертвых" и уже найденных "Gemini"
+    // 2. Загружаем историю
     const deadHashes = getHashesFromFile(CONFIG.files.dead);
-    const existingGeminiHashes = getHashesFromFile(CONFIG.files.gemini);
+    const geminiHashes = getHashesFromFile(CONFIG.files.gemini);
     
-    const results = { 
-        gemini: fs.readFileSync(CONFIG.files.gemini, 'utf-8').split('\n').filter(Boolean), 
-        general: [] 
-    };
-
-    log(`Начинаем проверку. Всего в подписке: ${incomingConfigs.length}`);
-    log(`Уже в базе: Gemini=${existingGeminiHashes.size}, Dead=${deadHashes.size}`);
-
-    for (let i = 0; i < incomingConfigs.length; i++) {
-        const line = incomingConfigs[i];
+    // 3. ФИЛЬТРАЦИЯ (Исключаем то, что уже проверяли когда-либо)
+    const tasks = allConfigs.filter(line => {
         const hash = crypto.createHash('md5').update(line).digest('hex');
+        return !deadHashes.has(hash) && !geminiHashes.has(hash);
+    });
 
-        // ЗАЩИТА ОТ ЗАЦИКЛИВАНИЯ И ПОВТОРОВ
-        if (deadHashes.has(hash)) {
-            log(`[${i+1}/${incomingConfigs.length}] Пропуск: Известен как мертвый`, 'DEBUG');
-            continue;
-        }
-        
-        if (existingGeminiHashes.size > 0 && existingGeminiHashes.has(hash)) {
-            log(`[${i+1}/${incomingConfigs.length}] Пропуск: Уже проверен и находится в Gemini.txt`, 'DEBUG');
-            continue;
-        }
+    log(`Всего в подписке: ${allConfigs.length}`);
+    log(`Пропуск проверенных: ${allConfigs.length - tasks.length}`);
+    log(`К проверке сейчас: ${tasks.length}`);
+
+    if (tasks.length === 0) {
+        log('Новых ссылок для проверки не найдено.', 'SUCCESS');
+        process.exit(0);
+    }
+
+    // Читаем текущие Gemini, чтобы дополнять файл
+    let currentGemini = fs.readFileSync(CONFIG.files.gemini, 'utf-8').split('\n').filter(Boolean);
+
+    // 4. ОДИНАРНЫЙ ПРОХОД (Strict Loop)
+    for (let i = 0; i < tasks.length; i++) {
+        const line = tasks[i];
+        log(`[${i + 1}/${tasks.length}] Проверка...`);
 
         const res = await testConfig(line, 30005);
 
         if (res.ok) {
-            log(`[UP] ПОДОШЁЛ!`, 'SUCCESS');
-            log(`  -> ВЫХОД: ${res.url}`, 'SUCCESS');
-            results.gemini.push(line);
-            // Добавляем в текущий набор хешей, чтобы не проверить дубликат в рамках одного запуска
-            existingGeminiHashes.add(hash);
+            log(`[UP] Gemini найден!`, 'SUCCESS');
+            currentGemini.push(line);
+            // Сохраняем прогресс сразу
+            fs.writeFileSync(CONFIG.files.gemini, [...new Set(currentGemini)].join('\n'));
         } else {
-            log(`[DOWN] ОТКЛОНЕН`, 'WARN');
-            log(`  -> ПРИЧИНА: ${res.url || res.error || 'Нет маркера /app'}`, 'WARN');
+            log(`[DOWN] Мимо: ${res.url || res.error || 'Check failed'}`, 'WARN');
             addToDead(line);
-            deadHashes.add(hash);
         }
     }
 
-    // Сохранение результатов (уникальных)
-    const uniqueGemini = Array.from(new Set(results.gemini));
-    fs.writeFileSync(CONFIG.files.gemini, uniqueGemini.join('\n'));
+    log(`Проверка завершена. Найдено новых: ${currentGemini.length - geminiHashes.size}`, 'SUCCESS');
     
-    log(`Проверка завершена. Итого Gemini: ${uniqueGemini.length}`, 'SUCCESS');
-    
-    // ГАРАНТИРОВАННОЕ ЗАВЕРШЕНИЕ ПРОЦЕССА
-    log('Завершение работы скрипта...');
-    process.exit(0);
+    // ГАРАНТИРОВАННОЕ ЗАВЕРШЕНИЕ
+    log('Форсированный выход...');
+    setTimeout(() => process.exit(0), 500);
 }
 
 main().catch(e => {
-    log(`Глобальная ошибка: ${e.message}`, 'ERROR');
+    log(`Глобальный сбой: ${e.message}`, 'ERROR');
     process.exit(1);
 });

@@ -1,7 +1,7 @@
 /**
  * Ultra-Light Gemini & Xray Checker (GitHub Ready)
  * Senior Coding Standard: Robustness, Logging, Idempotency.
- * 23.02.2026: Добавлена автоматическая загрузка бинарника под архитектуру системы.
+ * 23.02.2026: Логика загрузки бинарника вынесена во внешний модуль для чистоты кода.
  */
 
 const fs = require('fs');
@@ -11,6 +11,9 @@ const https = require('https');
 const crypto = require('crypto');
 const axios = require('axios');
 const { HttpProxyAgent } = require('http-proxy-agent');
+
+// Импорт загрузчика бинарников (библиотека в bin/)
+const { ensureBinary } = require('./bin_loader');
 
 // --- КОНФИГУРАЦИЯ ---
 const CONFIG = {
@@ -22,11 +25,6 @@ const CONFIG = {
     },
     binDir: path.join(__dirname, 'bin'),
     ladspeedBin: path.join(__dirname, 'bin', 'ladspeed'),
-    // Прямые ссылки на релизы для x64 и ARM64
-    binSources: {
-        'x64': 'https://github.com/uS-S/ladspeed/releases/download/v0.6.0/ladspeed-linux-amd64',
-        'arm64': 'https://github.com/uS-S/ladspeed/releases/download/v0.6.0/ladspeed-linux-arm64'
-    },
     testTimeout: 20000,
     geminiUrl: 'https://gemini.google.com',
     portRange: { min: 30100, max: 30900 }
@@ -44,71 +42,31 @@ function getRandomPort() {
     return Math.floor(Math.random() * (CONFIG.portRange.max - CONFIG.portRange.min + 1)) + CONFIG.portRange.min;
 }
 
-/**
- * Компактная загрузка файла с поддержкой редиректов
- */
-async function downloadFile(url, dest) {
-    return new Promise((resolve, reject) => {
-        https.get(url, (res) => {
-            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-                return downloadFile(res.headers.location, dest).then(resolve).catch(reject);
-            }
-            if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
-            
-            const stream = fs.createWriteStream(dest);
-            res.pipe(stream);
-            stream.on('finish', () => stream.close(resolve));
-            stream.on('error', (err) => { fs.unlink(dest, () => reject(err)); });
-        }).on('error', reject);
-    });
-}
-
-/**
- * Обеспечивает наличие рабочего бинарника
- */
-async function ensureBinary() {
-    if (!fs.existsSync(CONFIG.binDir)) fs.mkdirSync(CONFIG.binDir, { recursive: true });
-
-    const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
-    const url = CONFIG.binSources[arch];
-    
-    // Проверка: если файл есть и он не пустой (>1MB), пропускаем загрузку
-    if (fs.existsSync(CONFIG.ladspeedBin) && fs.statSync(CONFIG.ladspeedBin).size > 1024 * 1024) {
-        log(`Бинарник (${arch}) уже готов.`, 'SUCCESS');
-        return;
-    }
-
-    log(`Загрузка бинарника (${arch}) из GitHub...`);
-    try {
-        if (fs.existsSync(CONFIG.ladspeedBin)) fs.unlinkSync(CONFIG.ladspeedBin);
-        await downloadFile(url, CONFIG.ladspeedBin);
-        fs.chmodSync(CONFIG.ladspeedBin, '755');
-        log('Бинарник успешно скачан и подготовлен.', 'SUCCESS');
-    } catch (e) {
-        log(`Ошибка загрузки: ${e.message}`, 'ERROR');
-        process.exit(1);
-    }
-}
-
 // --- ИНИЦИАЛИЗАЦИЯ ---
 async function init() {
     log('Инициализация системы...');
     
     try {
+        // Убиваем старые процессы, если они остались
         execSync('pkill -9 ladspeed', { stdio: 'ignore' });
+        execSync('pkill -9 xray', { stdio: 'ignore' });
     } catch (e) {}
 
-    // Гарантируем наличие бинарника перед созданием файлов
-    await ensureBinary();
+    // Гарантируем наличие бинарников через внешний модуль bin_loader
+    // Передаем папку, путь к основному бину и логгер
+    await ensureBinary(CONFIG.binDir, CONFIG.ladspeedBin, log);
 
+    // Создаем файлы базы, если их нет
     Object.values(CONFIG.files).forEach(file => {
         if (!fs.existsSync(file)) fs.writeFileSync(file, '');
         try { fs.chmodSync(file, '666'); } catch(e) {}
     });
 
     try {
-        const fileInfo = execSync(`file ${CONFIG.ladspeedBin}`).toString();
-        log(`Диагностика: ${fileInfo.trim()}`, 'DEBUG');
+        if (fs.existsSync(CONFIG.ladspeedBin)) {
+            const fileInfo = execSync(`file ${CONFIG.ladspeedBin}`).toString();
+            log(`Диагностика ladspeed: ${fileInfo.trim()}`, 'DEBUG');
+        }
     } catch (e) {
         log(`Диагностика не удалась: ${e.message}`, 'WARN');
     }
@@ -284,6 +242,7 @@ async function testConfig(line, port) {
 
 // --- MAIN ---
 async function main() {
+    // Вызов инициализации (включает загрузку бинарников)
     await init();
 
     const allConfigs = await fetchSubscription();
@@ -327,11 +286,12 @@ async function main() {
     
     setTimeout(() => {
         try { execSync('pkill -9 ladspeed', { stdio: 'ignore' }); } catch(e) {}
+        try { execSync('pkill -9 xray', { stdio: 'ignore' }); } catch(e) {}
         process.kill(process.pid, 'SIGKILL'); 
     }, 1000);
 }
 
 main().catch(e => {
-    log(`Критический сбой: ${e.message}`, 'ERROR');
+    log(`Критический сбой в main: ${e.message}`, 'ERROR');
     process.exit(1);
 });

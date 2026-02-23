@@ -1,6 +1,231 @@
 /**
  * Ultra-Light Gemini & Xray Checker (GitHub Ready)
  * Senior Coding Standard: Robustness, Logging, Idempotency.
+ * 23.02.2026: Исправлена логика инициализации бинарников для GitHub Actions.
+ */
+
+const fs = require('fs');
+const path = require('path');
+const { spawn, execSync } = require('child_process');
+const https = require('https');
+const crypto = require('crypto');
+const axios = require('axios');
+const { HttpProxyAgent } = require('http-proxy-agent');
+
+// Импорт загрузчика бинарников (внешняя зависимость)
+const { ensureBinary } = require('./bin_loader');
+
+// --- КОНФИГУРАЦИЯ ---
+const CONFIG = {
+    defaultSubUrl: 'https://raw.githubusercontent.com/ceergo/parss/refs/heads/main/my_stable_configs.txt',
+    files: {
+        gemini: path.join(__dirname, 'gemini.txt'),
+        general: path.join(__dirname, 'general.txt'),
+        dead: path.join(__dirname, 'dead.txt')
+    },
+    binDir: path.join(__dirname, 'bin'),
+    ladspeedBin: path.join(__dirname, 'bin', 'ladspeed'),
+    testTimeout: 20000,
+    geminiUrl: 'https://gemini.google.com',
+    portRange: { min: 30100, max: 30900 }
+};
+
+// --- ЛОГИРОВАНИЕ ---
+const log = (msg, type = 'INFO') => {
+    const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19);
+    const colors = { INFO: '\x1b[36m', SUCCESS: '\x1b[32m', WARN: '\x1b[33m', ERROR: '\x1b[31m', DEBUG: '\x1b[90m', TRACE: '\x1b[95m' };
+    console.log(`${colors[type] || ''}[${timestamp}] [${type}] ${msg}\x1b[0m`);
+};
+
+// --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+function getRandomPort() {
+    return Math.floor(Math.random() * (CONFIG.portRange.max - CONFIG.portRange.min + 1)) + CONFIG.portRange.min;
+}
+
+// --- ИНИЦИАЛИЗАЦИЯ ---
+async function init() {
+    log('Инициализация системы...');
+    
+    // Очистка процессов перед стартом
+    try {
+        execSync('pkill -9 ladspeed', { stdio: 'ignore' });
+        execSync('pkill -9 xray', { stdio: 'ignore' });
+    } catch (e) {}
+
+    // Гарантируем наличие бинарников. 
+    // Если их нет в репозитории (а их там нет), bin_loader скачает их автоматически.
+    await ensureBinary(CONFIG.binDir, CONFIG.ladspeedBin, log);
+
+    // Создаем файлы базы данных, если они отсутствуют (важно для новых форков)
+    Object.values(CONFIG.files).forEach(file => {
+        if (!fs.existsSync(file)) {
+            log(`Создание отсутствующего файла: ${path.basename(file)}`, 'DEBUG');
+            fs.writeFileSync(file, '');
+        }
+        try { fs.chmodSync(file, '666'); } catch(e) {}
+    });
+
+    // Проверка работоспособности скачанного бинарника
+    try {
+        if (fs.existsSync(CONFIG.ladspeedBin)) {
+            const fileInfo = execSync(`file ${CONFIG.ladspeedBin}`).toString();
+            log(`Диагностика окружения: ${fileInfo.trim()}`, 'DEBUG');
+        } else {
+            log('Критическая ошибка: ladspeed не найден после инициализации!', 'ERROR');
+            process.exit(1);
+        }
+    } catch (e) {
+        log(`Диагностика не удалась (file command missing?), продолжаем...`, 'WARN');
+    }
+}
+
+// --- УМНЫЙ ПАРСИНГ ---
+async function fetchSubscription() {
+    const url = process.env.SUB_URL || CONFIG.defaultSubUrl;
+    log(`Загрузка подписки: ${url}`);
+    
+    return new Promise((resolve, reject) => {
+        https.get(url, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                let content = data;
+                // Проверка на Base64
+                if (!data.includes('://') && data.length > 20) {
+                    try {
+                        content = Buffer.from(data, 'base64').toString('utf-8');
+                        log('Декодирование Base64 успешно.');
+                    } catch (e) {
+                        log('Ошибка Base64, пробуем как plain text.', 'WARN');
+                    }
+                }
+                const lines = [...new Set(content.split(/\r?\n/)
+                    .map(l => l.trim())
+                    .filter(l => l.includes('://')))];
+                resolve(lines);
+            });
+        }).on('error', reject);
+    });
+}
+
+// --- БАЗА ХЕШЕЙ ---
+function getHashesFromFile(filePath) {
+    if (!fs.existsSync(filePath)) return new Set();
+    const data = fs.readFileSync(filePath, 'utf-8');
+    const lines = data.split('\n').map(l => l.trim()).filter(Boolean);
+    
+    // Для dead.txt храним полные строки хешей
+    if (filePath.endsWith('dead.txt')) return new Set(lines);
+    
+    // Для остальных файлов генерируем хеши на лету
+    return new Set(lines.map(line => crypto.createHash('md5').update(line).digest('hex')));
+}
+
+function addToDead(configLine) {
+    const hash = crypto.createHash('md5').update(configLine).digest('hex');
+    fs.appendFileSync(CONFIG.files.dead, hash + '\n');
+}
+
+// --- ПРОВЕРКА ГЕМИНИ ---
+async function checkGemini(port) {
+    const proxyUrl = `http://127.0.0.1:${port}`;
+    const agent = new HttpProxyAgent(proxyUrl);
+    
+    log(`[STEP 2] HTTP Запрос к Gemini через порт ${port}...`, 'TRACE');
+
+    try {
+        const response = await axios.get(CONFIG.geminiUrl, {
+            httpAgent: agent,
+            httpsAgent: agent,
+            timeout: 15000, 
+            validateStatus: null,
+            maxRedirects: 10,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5'
+            }
+        });
+
+        const finalUrl = response.request.res.responseUrl || response.config.url || '';
+        log(`[STEP 3] HTTP Ответ получен. Status: ${response.status}, Final URL: ${finalUrl}`, 'TRACE');
+
+        // Ключевой маркер доступности - редирект на /app
+        if (finalUrl.includes('/app')) {
+            return { ok: true, url: finalUrl, status: response.status };
+        }
+        
+        return { ok: false, url: finalUrl, status: response.status, msg: 'Маркер /app не найден в редиректе' };
+    } catch (err) {
+        let errMsg = err.message;
+        if (err.code === 'ECONNREFUSED') errMsg = `Порт ${port} закрыт (Туннель не поднялся)`;
+        if (err.code === 'ETIMEDOUT' || err.code === 'ECONNABORTED') errMsg = `Таймаут соединения через прокси`;
+        
+        return { ok: false, error: errMsg, code: err.code };
+    }
+}
+
+// --- ТЕСТ КОНФИГА ---
+async function testConfig(line, port) {
+    return new Promise((resolve) => {
+        // Убиваем любого, кто занял наш порт
+        try { execSync(`fuser -k ${port}/tcp`, { stdio: 'ignore' }); } catch(e) {}
+
+        log(`[STEP 1] Запуск бинарника на порту ${port}...`, 'TRACE');
+        
+        const command = `"${CONFIG.ladspeedBin}" -p ${port} -config-line "${line.replace(/"/g, '\\"')}"`;
+        
+        const proc = spawn(command, [], {
+            detached: true,
+            shell: true, 
+            stdio: ['pipe', 'pipe', 'pipe']
+        });
+
+        let binaryLogs = '';
+        const startTime = Date.now();
+        
+        const onData = (data) => {
+            const str = data.toString();
+            binaryLogs += str;
+            if (str.toLowerCase().includes('error') || str.toLowerCase().includes('fail') || str.toLowerCase().includes('invalid')) {
+                log(`[BINARY LOG] ${str.trim()}`, 'DEBUG');
+            }
+        };
+
+        proc.stderr.on('data', onData);
+        proc.stdout.on('data', onData);
+
+        const cleanup = () => {
+            try { 
+                process.kill(-proc.pid, 'SIGKILL'); 
+            } catch(e) { 
+                try { proc.kill('SIGKILL'); } catch(e2) {}
+            }
+        };
+
+        let isResolved = false;
+
+        // Даем время на установку соединения
+        const startWait = setTimeout(async () => {
+            if (isResolved) return;
+
+            log(`[STEP 1.5] Пауза на прогрев завершена. Проверка порта ${port}...`, 'DEBUG');
+            
+            const result = await checkGemini(port);
+            
+            if (!result.ok && result.error) {
+                log(`Диагностика неудачи: ${result.error}`, 'ERROR');
+                if (binaryLogs) {
+                    log('Последние логи бинарника перед ошибкой:', 'DEBUG');
+                    console.log(`\n${binaryLogs.slice(-1000).trim()}\n`);
+                }
+            }
+
+            cleanup();
+            isResolved = true;
+            resolve(result);/**
+ * Ultra-Light Gemini & Xray Checker (GitHub Ready)
+ * Senior Coding Standard: Robustness, Logging, Idempotency.
  * 23.02.2026: Логика загрузки бинарника вынесена во внешний модуль для чистоты кода.
  */
 

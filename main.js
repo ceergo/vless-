@@ -125,8 +125,10 @@ async function checkGemini(port) {
 // --- ТЕСТ КОНФИГА ---
 async function testConfig(line, port) {
     return new Promise((resolve) => {
-        // Здесь мы предполагаем, что ladspeed умеет принимать ссылку в аргумент или через временный файл
-        // Для примера: запуск бинарника
+        // Логируем начало теста с частью ссылки для идентификации
+        const shortLine = line.substring(0, 50) + '...';
+        log(`[TESTING] Конфиг: ${shortLine}`);
+
         const proc = spawn(CONFIG.ladspeedBin, ['-p', port.toString(), '-config-line', line], {
             detached: true
         });
@@ -168,22 +170,23 @@ async function main() {
             continue;
         }
 
-        log(`[${i+1}/${configs.length}] Тестирование...`);
         const res = await testConfig(line, 30005);
 
         if (res.ok) {
-            log(`[UP] Gemini доступен! (${res.url})`, 'SUCCESS');
+            log(`[UP] ПОДОШЁЛ!`, 'SUCCESS');
+            log(`  -> ВХОД: ${line.substring(0, 60)}...`, 'DEBUG');
+            log(`  -> ВЫХОД: ${res.url}`, 'SUCCESS');
             results.gemini.push(line);
         } else {
-            // Если была ошибка сети или нет /app, считаем дохлым для Gemini
-            log(`[DOWN] Не подошел: ${res.url || res.error || 'No /app marker'}`, 'WARN');
+            log(`[DOWN] ОТКЛОНЕН`, 'WARN');
+            log(`  -> ВХОД: ${line.substring(0, 60)}...`, 'DEBUG');
+            log(`  -> ВЫХОД: ${res.url || res.error || 'Нет маркера /app'}`, 'WARN');
             addToDead(line);
         }
     }
 
     // Сохранение (перезапись только рабочими)
     fs.writeFileSync(CONFIG.files.gemini, results.gemini.join('\n'));
-    // В general можно писать те, что просто работают, если добавить тест скорости
     fs.writeFileSync(CONFIG.files.general, results.general.join('\n'));
 
     log(`Готово! Gemini: ${results.gemini.length}, Dead: ${configs.length - results.gemini.length}`, 'SUCCESS');

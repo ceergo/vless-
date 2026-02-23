@@ -29,7 +29,7 @@ jobs:
         run: |
           XRAY_ZIP_URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
           curl -L "$XRAY_ZIP_URL" -o xray.zip
-          unzip -q xray.zip
+          unzip -o -q xray.zip
           # В архиве обычно лежит бинарник "xray"
           chmod +x xray
           rm -f xray.zip

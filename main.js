@@ -1,22 +1,20 @@
 /**
  * Ultra-Light Gemini & Xray Checker (GitHub Ready)
- * * Логика:
- * 1. Парсинг подписки (Vless, Vmess, SS, и т.д.)
- * 2. Фильтрация дубликатов и "мертвых" конфигов.
- * 3. Тест через Ladspeed (подмена DNS + TLS Fingerprint).
- * 4. Мониторинг Gemini на наличие '/app' в URL.
- * 5. Авто-обновление файлов gemini.txt и general.txt.
+ * Senior Coding Standard: Robustness, Logging, Idempotency.
  */
 
 const fs = require('fs');
 const path = require('path');
-const { spawn, execSync } = require('child_process');
+const { spawn } = require('child_process');
 const https = require('https');
 const crypto = require('crypto');
+const axios = require('axios');
+const { HttpProxyAgent } = require('http-proxy-agent');
 
 // --- КОНФИГУРАЦИЯ ---
 const CONFIG = {
-    subscriptionUrl: 'ВАША_RAW_ССЫЛКА_ТУТ', // Можно передать аргументом
+    // Твоя реальная ссылка на подписку
+    defaultSubUrl: 'https://raw.githubusercontent.com/ceergo/parss/refs/heads/main/my_stable_configs.txt',
     files: {
         gemini: path.join(__dirname, 'gemini.txt'),
         general: path.join(__dirname, 'general.txt'),
@@ -24,53 +22,70 @@ const CONFIG = {
     },
     binDir: path.join(__dirname, 'bin'),
     ladspeedBin: path.join(__dirname, 'bin', 'ladspeed'),
-    testTimeout: 15000, // 15 секунд на тест
-    speedTestSize: 1024 * 1024, // 1MB
+    testTimeout: 20000,
     geminiUrl: 'https://gemini.google.com'
 };
 
 // --- ЛОГИРОВАНИЕ ---
 const log = (msg, type = 'INFO') => {
     const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19);
-    console.log(`[${timestamp}] [${type}] ${msg}`);
+    const colors = { INFO: '\x1b[36m', SUCCESS: '\x1b[32m', WARN: '\x1b[33m', ERROR: '\x1b[31m', DEBUG: '\x1b[90m' };
+    console.log(`${colors[type] || ''}[${timestamp}] [${type}] ${msg}\x1b[0m`);
 };
 
 // --- ИНИЦИАЛИЗАЦИЯ ---
 function init() {
-    log('Запуск инициализации системы...');
-
-    // Проверка Root прав
-    try {
-        const uid = process.getuid();
-        if (uid !== 0) {
-            log('ВНИМАНИЕ: Скрипт запущен не от ROOT. Бинарники могут работать некорректно!', 'WARN');
-        } else {
-            log('Root права подтверждены.', 'SUCCESS');
-        }
-    } catch (e) {
-        log('Не удалось проверить UID (возможно, не Linux).', 'WARN');
-    }
-
-    // Создание папок и файлов
+    log('Инициализация системы...');
+    
     if (!fs.existsSync(CONFIG.binDir)) fs.mkdirSync(CONFIG.binDir);
+    
     Object.values(CONFIG.files).forEach(file => {
         if (!fs.existsSync(file)) fs.writeFileSync(file, '');
+        // Даем права на чтение/запись всем, чтобы git мог закомитить из-под root
+        try { fs.chmodSync(file, '666'); } catch(e) {}
     });
 
-    // TODO: Здесь можно добавить авто-скачивание ladspeed бинарника под архитектуру
-    // execSync(`chmod +x ${CONFIG.ladspeedBin} 2>/dev/null || true`);
+    if (!fs.existsSync(CONFIG.ladspeedBin)) {
+        log(`КРИТИЧЕСКАЯ ОШИБКА: Бинарник ${CONFIG.ladspeedBin} не найден!`, 'ERROR');
+        process.exit(1);
+    }
+    
+    try {
+        const uid = process.getuid();
+        if (uid !== 0) log('Запуск не от ROOT. Работа с DNS может быть ограничена.', 'WARN');
+    } catch (e) {}
 }
 
-// --- ПАРСИНГ ---
-function parseSubscription(data) {
-    log('Парсинг подписки...');
-    const content = Buffer.from(data, 'base64').toString('utf-8');
-    const lines = content.split(/\r?\n/).filter(line => line.trim().length > 0);
-    log(`Найдено ${lines.length} конфигураций в подписке.`);
-    return lines;
+// --- УМНЫЙ ПАРСИНГ ---
+async function fetchSubscription() {
+    const url = process.env.SUB_URL || CONFIG.defaultSubUrl;
+    log(`Загрузка подписки из: ${url}`);
+    
+    return new Promise((resolve, reject) => {
+        https.get(url, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                let content = data;
+                // Проверяем, не Base64 ли это
+                if (!data.includes('://') && data.length > 20) {
+                    try {
+                        content = Buffer.from(data, 'base64').toString('utf-8');
+                        log('Обнаружен формат Base64, декодирование успешно.');
+                    } catch (e) {
+                        log('Не удалось декодировать Base64, используем как текст.', 'WARN');
+                    }
+                }
+                const lines = content.split(/\r?\n/)
+                    .map(l => l.trim())
+                    .filter(l => l.includes('://'));
+                resolve(lines);
+            });
+        }).on('error', reject);
+    });
 }
 
-// --- УПРАВЛЕНИЕ БАЗОЙ ---
+// --- БАЗА ХЕШЕЙ ---
 function getDeadHashes() {
     const data = fs.readFileSync(CONFIG.files.dead, 'utf-8');
     return new Set(data.split('\n').filter(Boolean));
@@ -81,104 +96,97 @@ function addToDead(configLine) {
     fs.appendFileSync(CONFIG.files.dead, hash + '\n');
 }
 
-// --- ТЕСТ КОНФИГУРАЦИИ ---
-async function checkConfig(configLine, port) {
-    return new Promise((resolve) => {
-        log(`Тестируем конфиг на порту ${port}...`);
-
-        // Запуск Ladspeed (симуляция)
-        // В реальности здесь запускается: ladspeed -config <generated_json> -port <port>
-        const proxyProcess = spawn(CONFIG.ladspeedBin, ['-c', 'inline_config', '-p', port.toString()], {
-            env: { ...process.env, DNS_SERVERS: '8.8.8.8' }
+// --- ПРОВЕРКА ГЕМИНИ ---
+async function checkGemini(port) {
+    const agent = new HttpProxyAgent(`http://127.0.0.1:${port}`);
+    try {
+        const response = await axios.get(CONFIG.geminiUrl, {
+            httpAgent: agent,
+            httpsAgent: agent,
+            timeout: 10000,
+            validateStatus: null,
+            maxRedirects: 5,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
         });
 
-        let isGeminiUp = false;
-        let isSpeedOk = false;
+        // Самое важное: мониторим финальный URL
+        const finalUrl = response.request.res.responseUrl || '';
+        if (finalUrl.includes('/app')) {
+            return { ok: true, url: finalUrl };
+        }
+        return { ok: false, url: finalUrl };
+    } catch (err) {
+        return { ok: false, error: err.message };
+    }
+}
+
+// --- ТЕСТ КОНФИГА ---
+async function testConfig(line, port) {
+    return new Promise((resolve) => {
+        // Здесь мы предполагаем, что ladspeed умеет принимать ссылку в аргумент или через временный файл
+        // Для примера: запуск бинарника
+        const proc = spawn(CONFIG.ladspeedBin, ['-p', port.toString(), '-config-line', line], {
+            detached: true
+        });
 
         const cleanup = () => {
-            proxyProcess.kill('SIGKILL');
+            try { process.kill(-proc.pid, 'SIGKILL'); } catch(e) { proc.kill('SIGKILL'); }
         };
 
-        // Даем прокси 2 секунды на прогрев
+        // Ждем инициализации туннеля
         setTimeout(async () => {
-            try {
-                // 1. Тест Скорости (1MB)
-                const start = Date.now();
-                // Здесь будет запрос через прокси (localhost:port)
-                // if (downloadedSize >= 1MB) isSpeedOk = true;
-                isSpeedOk = true; // Заглушка для логики
+            const result = await checkGemini(port);
+            cleanup();
+            resolve(result);
+        }, 3000);
 
-                // 2. Тест Gemini URL Monitor
-                // Мы смотрим на res.url после всех редиректов
-                const finalUrl = await getFinalUrl(CONFIG.geminiUrl, port);
-                
-                if (finalUrl.includes('/app')) {
-                    log(`МАРКЕР [UP] НАЙДЕН: ${finalUrl}`, 'SUCCESS');
-                    isGeminiUp = true;
-                } else {
-                    log(`Gemini доступен, но маркер /app отсутствует. URL: ${finalUrl}`, 'INFO');
-                }
-
-                cleanup();
-                resolve({ isGeminiUp, isSpeedOk });
-
-            } catch (err) {
-                log(`Ошибка при тесте через порт ${port}: ${err.message}`, 'ERROR');
-                cleanup();
-                resolve({ isGeminiUp: false, isSpeedOk: false });
-            }
-        }, 2000);
+        proc.on('error', (err) => {
+            log(`Ошибка запуска Ladspeed: ${err.message}`, 'ERROR');
+            resolve({ ok: false });
+        });
     });
 }
 
-async function getFinalUrl(targetUrl, proxyPort) {
-    // В реальности используем http-proxy-agent или axios с прокси
-    // Здесь имитируем логику проверки редиректа
-    return new Promise((resolve) => {
-        // Имитация: если прокси хороший, вернет URL с /app
-        // На продакшене тут реальный запрос через localhost:proxyPort
-        setTimeout(() => resolve('https://gemini.google.com/app?hl=ru'), 1000);
-    });
-}
-
-// --- ОСНОВНОЙ ЦИКЛ ---
+// --- MAIN ---
 async function main() {
     init();
 
+    const configs = await fetchSubscription();
     const deadHashes = getDeadHashes();
-    const rawConfigs = ["vless://uuid@host:port", "vmess://..."]; // Тестовый пример
-    
-    const results = {
-        gemini: [],
-        general: []
-    };
+    const results = { gemini: [], general: [] };
 
-    for (const line of rawConfigs) {
+    log(`Начинаем проверку ${configs.length} конфигураций...`);
+
+    for (let i = 0; i < configs.length; i++) {
+        const line = configs[i];
         const hash = crypto.createHash('md5').update(line).digest('hex');
-        
+
         if (deadHashes.has(hash)) {
-            log('Пропуск: ссылка помечена как "сдохшая".', 'DEBUG');
+            log(`[${i+1}/${configs.length}] Пропуск (в черном списке)`, 'DEBUG');
             continue;
         }
 
-        const testResult = await checkConfig(line, 30001);
+        log(`[${i+1}/${configs.length}] Тестирование...`);
+        const res = await testConfig(line, 30005);
 
-        if (testResult.isGeminiUp) {
+        if (res.ok) {
+            log(`[UP] Gemini доступен! (${res.url})`, 'SUCCESS');
             results.gemini.push(line);
-        } else if (testResult.isSpeedOk) {
-            results.general.push(line);
         } else {
-            log('Конфиг не прошел тесты, добавляем в список мертвых.', 'WARN');
+            // Если была ошибка сети или нет /app, считаем дохлым для Gemini
+            log(`[DOWN] Не подошел: ${res.url || res.error || 'No /app marker'}`, 'WARN');
             addToDead(line);
         }
     }
 
-    // Сохранение результатов (Перезапись)
+    // Сохранение (перезапись только рабочими)
     fs.writeFileSync(CONFIG.files.gemini, results.gemini.join('\n'));
+    // В general можно писать те, что просто работают, если добавить тест скорости
     fs.writeFileSync(CONFIG.files.general, results.general.join('\n'));
-    
-    log(`Обработка завершена. Gemini: ${results.gemini.length}, Общие: ${results.general.length}`, 'SUCCESS');
+
+    log(`Готово! Gemini: ${results.gemini.length}, Dead: ${configs.length - results.gemini.length}`, 'SUCCESS');
 }
 
-// Запуск
-main().catch(err => log(err.message, 'FATAL'));
+main().catch(e => log(e.message, 'ERROR'));

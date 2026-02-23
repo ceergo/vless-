@@ -1,7 +1,7 @@
 /**
  * Ultra-Light Gemini & Xray Checker (GitHub Ready)
  * Senior Coding Standard: Robustness, Logging, Idempotency.
- * 23.02.2026: Добавлена динамическая выборка портов для исключения конфликтов.
+ * 23.02.2026: Исправлен запуск бинарника (проблема Exit Code 0) и передача аргументов.
  */
 
 const fs = require('fs');
@@ -24,7 +24,7 @@ const CONFIG = {
     ladspeedBin: path.join(__dirname, 'bin', 'ladspeed'),
     testTimeout: 20000,
     geminiUrl: 'https://gemini.google.com',
-    portRange: { min: 30100, max: 30900 } // Диапазон для случайных портов
+    portRange: { min: 30100, max: 30900 }
 };
 
 // --- ЛОГИРОВАНИЕ ---
@@ -151,23 +151,26 @@ async function checkGemini(port) {
 // --- ТЕСТ КОНФИГА ---
 async function testConfig(line, port) {
     return new Promise((resolve) => {
-        // Очистка порта перед использованием (на всякий случай)
         try { execSync(`fuser -k ${port}/tcp`, { stdio: 'ignore' }); } catch(e) {}
 
-        log(`[STEP 1] Запуск бинарника на случайном порту ${port}...`, 'TRACE');
+        log(`[STEP 1] Запуск бинарника на порту ${port}...`, 'TRACE');
         
+        // Используем более надежный способ передачи длинных строк через кавычки
         const proc = spawn(CONFIG.ladspeedBin, ['-p', port.toString(), '-config-line', line], {
             detached: true,
+            shell: false, // Отключаем shell, чтобы избежать двойного парсинга
             stdio: ['pipe', 'pipe', 'pipe']
         });
 
         let binaryLogs = '';
+        const startTime = Date.now();
         
         const onData = (data) => {
             const str = data.toString();
             binaryLogs += str;
-            if (str.toLowerCase().includes('error') || str.toLowerCase().includes('fail') || str.toLowerCase().includes('fatal')) {
-                log(`[BINARY] ${str.trim()}`, 'ERROR');
+            // Логируем все, что пишет бинарник, если там есть подозрение на ошибку
+            if (str.toLowerCase().includes('error') || str.toLowerCase().includes('fail') || str.toLowerCase().includes('invalid')) {
+                log(`[BINARY LOG] ${str.trim()}`, 'DEBUG');
             }
         };
 
@@ -194,7 +197,8 @@ async function testConfig(line, port) {
             if (!result.ok && result.error) {
                 log(`Диагностика неудачи: ${result.error}`, 'ERROR');
                 if (binaryLogs) {
-                    console.log(`--- ЛОГ БИНАРНИКА ---\n${binaryLogs.trim()}\n--- КОНЕЦ ---`);
+                    log('Полный лог бинарника перед ошибкой:', 'DEBUG');
+                    console.log(`\n${binaryLogs.trim()}\n`);
                 }
             }
 
@@ -213,11 +217,21 @@ async function testConfig(line, port) {
         });
 
         proc.on('exit', (code) => {
-            if (!isResolved) {
-                log(`Бинарник упал с кодом ${code} до завершения теста.`, 'ERROR');
+            if (isResolved) return;
+            
+            const duration = Date.now() - startTime;
+            // Если бинарник вышел слишком быстро (например, за 1 сек), значит он не запустился
+            if (duration < 2000) {
+                log(`Бинарник мгновенно завершился (код: ${code}, время: ${duration}мс).`, 'ERROR');
+                if (binaryLogs) {
+                    log('Вывод бинарника:', 'WARN');
+                    console.log(`>>> ${binaryLogs.trim()}`);
+                } else {
+                    log('Бинарник завершился без какого-либо вывода в консоль.', 'WARN');
+                }
                 clearTimeout(startWait);
                 isResolved = true;
-                resolve({ ok: false, error: `Binary exited with code ${code}`, logs: binaryLogs });
+                resolve({ ok: false, error: `Quick exit with code ${code}` });
             }
         });
     });
@@ -247,7 +261,7 @@ async function main() {
 
     for (let i = 0; i < tasks.length; i++) {
         const line = tasks[i];
-        const currentPort = getRandomPort(); // Генерируем новый порт для каждого теста
+        const currentPort = getRandomPort();
         
         log(`[${i + 1}/${tasks.length}] === ТЕСТ (Порт: ${currentPort}) ===`);
 

@@ -147,7 +147,7 @@ def parse_node(node_str):
             
         return node
     except Exception as e:
-        print(f"Error parsing node {node_str[:50]}: {e}")
+        logging.error(f"Error parsing node {node_str}: {e}")
         return None
 
 # --- XRAY CONFIG BUILDER ---
@@ -255,7 +255,7 @@ async def is_port_open(port):
     except:
         return False
 
-async def run_xray_test(node, local_port):
+async async def run_xray_test(node, local_port):
     config = build_xray_config(node, local_port)
     config_file = f"temp_config_{local_port}.json"
     with open(config_file, 'w') as f:
@@ -1507,17 +1507,20 @@ def atomic_write(filename, content):
     os.replace(temp_file, filename)
 
 async def main():
-    print(f"[{datetime.now()}] Starting subscription check...")
+    logging.info(f"Starting subscription check...")
     
     # Step 1: Download subscriptions
     raw_content = ""
     for url in RAW_SUBSCRIPTION_URLS:
         try:
+            logging.info(f"Downloading subscription from: {url}")
             r = requests.get(url, timeout=10)
             if r.status_code == 200:
                 raw_content += r.text + "\n"
+            else:
+                logging.error(f"Failed to download {url}: HTTP Status {r.status_code}")
         except Exception as e:
-            print(f"Error downloading {url}: {e}")
+            logging.error(f"Error downloading {url}: {e}")
             
     atomic_write(RAW_COPY_FILE, raw_content)
     

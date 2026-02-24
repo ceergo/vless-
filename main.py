@@ -10,6 +10,10 @@ import requests
 import httpx
 from urllib.parse import urlparse, parse_qs, unquote
 from datetime import datetime
+import logging
+
+# --- Configure logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- CONFIGURATION ---
 RAW_SUBSCRIPTION_URLS = [
@@ -49,7 +53,8 @@ def decode_base64(data):
         if missing_padding:
             data += '=' * (4 - missing_padding)
         return base64.b64decode(data).decode('utf-8', errors='ignore')
-    except:
+    except Exception as e:
+        logging.error(f"Error decoding base64: {e}, data: {data[:50]}...")
         return ""
 
 def industrial_extractor(source_text):
@@ -97,15 +102,28 @@ def parse_node(node_str):
                 else:
                     method, password = 'aes-256-gcm', decoded_user
                 
-                host_port = serverinfo.split(':', 1)
-                return {
+                host_port_part = serverinfo_and_params.split('?', 1)[0]
+                
+                host_port_split = host_port_part.split(':', 1)
+                
+                host = host_port_split[0]
+                port = int(host_port_split[1]) if len(host_port_split) > 1 else 443
+
+                query_params = parse_qs(urlparse(node_str).query)
+                
+                node = {
                     'protocol': 'shadowsocks',
-                    'host': host_port[0],
-                    'port': int(host_port[1]) if len(host_port) > 1 else 443,
+                    'host': host,
+                    'port': port,
                     'method': method,
                     'password': password,
                     'raw': node_str
                 }
+                
+                for key, value in query_params.items():
+                    node[key] = value[0] 
+                    
+                return node
 
         if node_str.startswith('vmess://'):
             payload = node_str[8:]

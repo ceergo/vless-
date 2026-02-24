@@ -1,15 +1,15 @@
-name: Check proxy subscriptions
+name: Check Proxy Subscriptions
 
 on:
   schedule:
-    # Каждые 3 часа
-    - cron: "0 */3 * * *"
+    - cron: '0 */3 * * *' # Every 3 hours
   workflow_dispatch:
 
 jobs:
   check-proxies:
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
@@ -18,27 +18,27 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
+          cache: 'pip'
 
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Download Xray (linux-amd64)
+      - name: Download Xray
         run: |
-          XRAY_ZIP_URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
-          curl -L "$XRAY_ZIP_URL" -o xray.zip
-          unzip -o -q xray.zip
-          # В архиве обычно лежит бинарник "xray"
+          XRAY_VERSION=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep tag_name | cut -d '"' -f 4)
+          curl -L "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" -o xray.zip
+          unzip xray.zip xray
           chmod +x xray
-          rm -f xray.zip
 
-      - name: Download librespeed-cli (linux-amd64)
-        run: |
-          LIBRESPEED_URL="https://github.com/librespeed/speedtest-cli/releases/latest/download/speedtest-cli_v1.0.12_linux_amd64"
-          curl -L "$LIBRESPEED_URL" -o librespeed-cli
-          chmod +x librespeed-cli
-
-      - name: Run subscription checker
+      - name: Run script
         run: python main.py
+
+      - name: Commit and push results
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add *.txt
+          git commit -m "Update proxy results [$(date)]" || echo "No changes to commit"
+          git push
